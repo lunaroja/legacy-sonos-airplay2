@@ -1,0 +1,19 @@
+{
+  "name": "shairport-sync",
+  "version": "5.6.3",
+  "upstream_commit": "7ce90d89529dd760488f20592a7cbff626672f6c",
+  "url": "https://codeload.github.com/mikebrady/shairport-sync/tar.gz/refs/tags/5.6.3",
+  "archive": "shairport-5.6.3.tar.gz",
+  "sha256": "670f9cefdb9c2d70f7df71890e63ab0a31d08a815dd0734245d935bfd01e766e",
+  "source_date_epoch": 1794304627,
+  "patches": [
+    {"path": "patches/01-startup.patch", "sha256": "a819a3cbea8f0a2d3cf26a4dec58b908a63ad121d48e2302ee91705825d366dc"},
+    {"path": "patches/02-observer.patch", "sha256": "5a6997542bf5f386b5aeedf7a8d258912e04795b88df270ab3a45305fca44fce"},
+    {"path": "patches/03-volume.patch", "sha256": "9ed98ec77431629623262c4fb2878d3f4afc3f9149f5b4f317d6855a9d0e5500"},
+    {"path": "patches/04-pipe-cancellation.patch", "sha256": "24006b4110e1fc65c3dc77b91d208e551c9ad2034f0906691df922b775066f7b"}
+  ],
+  "configure": ["--with-pipe", "--with-airplay-2", "--with-ssl=openssl", "--with-avahi", "--with-metadata"],
+  "expected_observer_protocol": 2,
+  "expected_observer_bytes": 88,
+  "expected_shared_memory_interface": 11
+}

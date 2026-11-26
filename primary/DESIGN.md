@@ -1,0 +1,7 @@
+# Standalone playback and native grouping design
+
+Primary lifecycle: fresh authenticated Office session + idle standalone target -> owned WAV playback; fresh same AirPlay group and native coordinator source -> target-only native join; ordinary pause/FLUSH -> retain ownership and group, drain PCM; explicit Office END -> detach only the bridge-created target, then stop/clear that target with exact readback, while the coordinator source and transport remain untouched. Fresh native end while Office continues may release our target and resume its standalone WAV. Unknown/foreign source or topology must not authorize writes.
+
+Coordinator configuration is optional. Solo operation does not require coordinator discovery, availability or subscription health. No coordinator mutation is supported by the wire API. No silent-source, borrowing, custom native UDP/clock, reference receipt or route manipulation code may be imported by primary runtime.
+
+Trust boundaries: configured IPv4/UUID endpoints, bounded SOAP/XML and GENA, source-IP plus random capability for WAV and callback paths, a private launcher-owned FIFO, and Linux per-message PID/UID plus inherited-socket inode for session events. LAN identity is not cryptographic authentication. Every target write has a durable intent, one attempt and two stable readbacks; ambiguous state requires explicit reconciliation and is never automatically replayed. No raw media or source identifiers are logged.

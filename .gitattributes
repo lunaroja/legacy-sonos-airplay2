@@ -1,0 +1,2 @@
+# Preserve exact context bytes in content-pinned upstream patch inputs.
+primary/receiver-source/patches/*.patch -whitespace

@@ -1,0 +1,1238 @@
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -116,7 +116,7 @@
+ endif
+ 
+ if USE_PIPE
+-shairport_sync_SOURCES += audio_pipe.c
++shairport_sync_SOURCES += audio_pipe.c spts_diag.c
+ endif
+ 
+ if USE_DUMMY
+--- a/ap2_buffered_audio_processor.c
++++ b/ap2_buffered_audio_processor.c
+@@ -24,6 +24,7 @@
+  * OTHER DEALINGS IN THE SOFTWARE.
+  */
+ 
++#include "spts_diag.h"
+ #include "ap2_buffered_audio_processor.h"
+ #include "common.h"
+ #include "player.h"
+@@ -91,6 +92,7 @@
+ }
+ 
+ void rtp_buffered_audio_cleanup_handler(__attribute__((unused)) void *arg) {
++  spdiag_bump(SPD_BUFFERED_THREAD_STOP,1);
+   debug(2, "Buffered Audio Receiver Cleanup Start.");
+   rtsp_conn_info *conn = (rtsp_conn_info *)arg;
+   safe_socket_close(&conn->buffered_audio_socket);
+@@ -100,6 +102,7 @@
+ }
+ 
+ void *rtp_buffered_audio_processor(void *arg) {
++  spdiag_bump(SPD_BUFFERED_THREAD_START,1);
+   rtsp_conn_info *conn = (rtsp_conn_info *)arg;
+ 
+   conn->incoming_ssrc = 0; // reset
+@@ -211,8 +214,11 @@
+   // double requested_lead_time = 0.0; // normal lead time minimum -- maybe  it should be about 0.1
+ 
+   // wait until our timing information is valid
+-  while (have_ptp_timing_information(conn) == 0)
++  while (have_ptp_timing_information(conn) == 0) {
++    spdiag_bump(SPD_INITIAL_PTP_WAIT,1);
+     usleep(1000);
++  }
++  spdiag_bump(SPD_INITIAL_PTP_READY,1);
+ 
+   reset_buffer(conn); // in case there is any garbage in the player
+ 
+@@ -273,6 +279,7 @@
+   
+           if (nread > 0) {
+             // got the block
++            spdiag_bump(SPD_BLOCK_READ,1);
+             blocks_read++;                  // note, this doesn't mean they are valid audio blocks
+   
+             // get the sequence number
+@@ -288,6 +295,7 @@
+             if (payload_ssrc != SSRC_NONE) // ignore intervening SSRC blocks
+               previous_ssrc = payload_ssrc;
+             payload_ssrc = nctohl(&packet[8]);
++            spdiag_bump(ssrc_is_recognised(payload_ssrc)?SPD_BLOCK_RECOGNIZED:SPD_BLOCK_UNKNOWN,1);
+             
+             if ((payload_ssrc != previous_ssrc) && (payload_ssrc != SSRC_NONE)) {
+ #ifdef CONFIG_METADATA
+@@ -565,6 +573,7 @@
+         uint64_t buffer_should_be_time;
+ 
+         int have_valid_time = (frame_to_local_time(timestamp, &buffer_should_be_time, conn) == 0);
++        if(!have_valid_time)spdiag_bump(SPD_BLOCK_WAIT_CLOCK,1);
+ 
+         // A slight problem here is that counting the number of buffers may not be sufficient,
+         // because the actual device may be
+@@ -583,6 +592,9 @@
+         if (have_valid_time != 0) {
+           // calculate the lead time to make sure it's not too early...
+           int64_t lead_time = buffer_should_be_time - get_absolute_time_in_ns();
++          if(!play_enabled)spdiag_bump(SPD_BLOCK_WAIT_DISABLED,1);
++          else if(lead_time*1E-9 >= config.audio_decoded_buffer_desired_length+0.1)spdiag_bump(SPD_BLOCK_WAIT_EARLY,1);
++          if(lead_time<0)spdiag_bump(SPD_BLOCK_LATE,1);
+           if ((play_enabled != 0) &&
+               (lead_time * 1E-9 < (config.audio_decoded_buffer_desired_length + 0.1))) {
+             //            && (audio_decoded_buffer_below_desired_length != 0)
+@@ -625,12 +637,14 @@
+                         8,                // authenticated additional data length
+                         nonce,
+                         conn->session_key); // *k
++                    spdiag_bump(response==0?SPD_DECRYPT_OK:SPD_DECRYPT_FAILED,1);
+                     if (response != 0)
+                       debug(1, "Error decrypting audio packet %u -- packet length %zd.", seq_no,
+                             nread);
+                   } else {
+                     debug(2,
+                           "No session key, so the audio packet can not be deciphered -- skipped.");
++                    spdiag_bump(SPD_DECRYPT_NO_KEY,1);
+                   }
+ 
+                   if ((response == 0) && (new_payload_length > 0)) {
+@@ -728,9 +742,11 @@
+                       }
+                     }
+                     if (skip_this_block == 0) {
++                      spdiag_bump(SPD_PLAYER_SUBMIT,1);
+                       uint32_t packet_size = player_put_packet(
+                           payload_ssrc, sequence_number_for_player, timestamp, payload_pointer,
+                           payload_length, mute, timestamp_difference, conn, seq_no);
++                      if(packet_size)spdiag_bump(SPD_PLAYER_SUBMIT_NONZERO,1);
+                       debug(4, "block %u, timestamp %u, length %u sent to the player.", seq_no,
+                             timestamp, packet_size);
+                       // keep the 64-bit timestamp extension reference up to date
+--- a/audio.h
++++ b/audio.h
+@@ -3,6 +3,7 @@
+ 
+ #include <libconfig.h>
+ #include <stdint.h>
++#include "spts_timing.h"
+ 
+ // clang-format off
+ // Play samples provided may be from the source, in which case they will be timed
+@@ -97,6 +98,9 @@
+   // also, will return a 1 if it is actually using the mute facility, 0 otherwise
+   int (*mute)(int do_mute);
+ 
++  /* Private optional callback; NULL unless timestamped_reanchor is enabled. */
++  int (*play_timed_with_provenance)(void *buf, int samples, uint32_t timestamp,
++                                    const spts_timing *timing);
+ } audio_output;
+ 
+ // this looks for a suitable configuration in the right order and checks possible
+--- a/audio_pipe.c
++++ b/audio_pipe.c
+@@ -28,6 +28,7 @@
+  * OTHER DEALINGS IN THE SOFTWARE.
+  */
+ 
++#include "spts_diag.h"
+ #include "audio.h"
+ #include "common.h"
+ #include <errno.h>
+@@ -40,6 +41,7 @@
+ #include <unistd.h>
+ 
+ #include "utilities/network_utilities.h"
++#include "pts_writer.h"
+ 
+ static int fd = -1;
+ static int warned = 0;
+@@ -48,7 +50,137 @@
+ char *pipename = NULL;
+ char *default_pipe_name = "/tmp/shairport-sync-audio";
+ 
++/* Private SPTS v2 extension; raw pipe behavior remains selected by default. */
++enum { PTS_TIMED=1, PTS_UNTIMED=2, PTS_FLUSH=3, PTS_STOP=4 };
++static int timestamped_pipe = 0, timestamped_reanchor = 0;
++static int timestamped_write_timeout_ms = 50;
++static uint32_t pts_epoch = 0, pts_sequence = 0;
++static struct spw pts_writer;
++static int pts_writer_ready = 0, pts_started = 0;
++static spts_gate pts_gate;
++static pthread_mutex_t pts_order_mutex = PTHREAD_MUTEX_INITIALIZER;
++extern audio_output audio_pipe;
++
++static void pts_order_unlock(void *arg) { pthread_mutex_unlock(arg); }
++
++/* Called only under pts_order_mutex, including epoch/sequence allocation.
++ * A failed writer remains closed/poisoned; cleanup never appends a record. */
++static enum spw_failure emit_pts_locked(unsigned kind, uint32_t frames, uint32_t rtp,
++                                         uint64_t target, const void *pcm) {
++  if (!pts_writer_ready || pts_writer.poisoned) return SPW_POISONED;
++  if (pts_sequence == UINT32_MAX || (kind <= PTS_UNTIMED && !pts_started)) {
++    pthread_mutex_lock(&pts_writer.mutex);
++    spw_poison_locked(&pts_writer, SPW_INVALID);
++    pthread_mutex_unlock(&pts_writer.mutex);
++    return SPW_INVALID;
++  }
++  uint64_t before=spw_now(), observed=get_absolute_time_in_ns(), after=spw_now();
++  uint64_t deadline=spw_deadline(before, observed, target, kind==PTS_TIMED,
++      (uint64_t)timestamped_write_timeout_ms*1000000, after-before);
++  if (!deadline) {
++    pthread_mutex_lock(&pts_writer.mutex);
++    spw_poison_locked(&pts_writer, SPW_DEADLINE);
++    pthread_mutex_unlock(&pts_writer.mutex);
++    return SPW_DEADLINE;
++  }
++  enum spw_failure written=spw_send_until(&pts_writer, kind, pts_epoch, ++pts_sequence, target,
++                        observed, frames, rtp, pcm, deadline);
++  if (written==SPW_OK && kind<=PTS_UNTIMED) spdiag_bump(kind==PTS_TIMED?SPD_WIRE_TIMED_OK:SPD_WIRE_UNTIMED_OK,1);
++  return written;
++}
++
++static enum spw_failure pts_boundary_locked(void) {
++  if (pts_epoch == UINT32_MAX) {
++    pthread_mutex_lock(&pts_writer.mutex);
++    spw_poison_locked(&pts_writer, SPW_INVALID);
++    pthread_mutex_unlock(&pts_writer.mutex);
++    return SPW_INVALID;
++  }
++  ++pts_epoch;
++  spts_gate_reset(&pts_gate);
++  enum spw_failure result=emit_pts_locked(PTS_FLUSH, 0, 0, 0, NULL);
++  if (result==SPW_OK) pts_started=1;
++  return result;
++}
++
++static void pts_report_failure(enum spw_failure result) {
++  if (result != SPW_OK)
++    die("SPTS write failure code=%u bytes=%zu", (unsigned)result,
++        pts_writer_ready ? pts_writer.bytes_in_failed_record : 0);
++}
++
++static void pts_flush(void) {
++  spdiag_bump(SPD_PIPE_FLUSH,1);
++  if (!timestamped_pipe) return;
++  enum spw_failure result=SPW_OK;
++  pthread_mutex_lock(&pts_order_mutex);
++  pthread_cleanup_push(pts_order_unlock, &pts_order_mutex);
++  if (pts_writer_ready && !pts_writer.poisoned) result=pts_boundary_locked();
++  pthread_cleanup_pop(1);
++  pts_report_failure(result);
++}
++
++static int pts_prepare(void) {
++  enum spw_failure result=SPW_OK;
++  pthread_mutex_lock(&pts_order_mutex);
++  pthread_cleanup_push(pts_order_unlock, &pts_order_mutex);
++  if (!pts_writer_ready) {
++    int pipe_fd=try_to_open_pipe_for_writing(pipename);
++    if (pipe_fd < 0) result=SPW_PEER_CLOSED;
++    else if (spw_init(&pts_writer, pipe_fd) != 0) { close(pipe_fd); result=SPW_IO_ERROR; }
++    else pts_writer_ready=1;
++  }
++  if (result==SPW_OK) result=pts_writer.poisoned ? SPW_POISONED : pts_boundary_locked();
++  pthread_cleanup_pop(1);
++  pts_report_failure(result);
++  return result==SPW_OK ? 0 : -1;
++}
++
++static void emit_pts(unsigned kind, uint32_t frames, uint32_t rtp,
++                     uint64_t playtime, const void *pcm) {
++  int64_t raw_target=kind==PTS_TIMED ?
++      (int64_t)playtime-(int64_t)(config.audio_backend_latency_offset*1e9) : 0;
++  enum spw_failure result=SPW_INVALID;
++  pthread_mutex_lock(&pts_order_mutex);
++  pthread_cleanup_push(pts_order_unlock, &pts_order_mutex);
++  if (raw_target >= 0)
++    result=emit_pts_locked(kind, frames, rtp, (uint64_t)raw_target, pcm);
++  pthread_cleanup_pop(1);
++  pts_report_failure(result);
++}
++
++static int play_timed_with_provenance(void *buf, int samples, uint32_t rtp,
++                                      const spts_timing *timing) {
++  enum spw_failure result=SPW_INVALID;
++  int boundary=-1;
++  int64_t delta=0;
++  uint32_t emitted_epoch=0;
++  pthread_mutex_lock(&pts_order_mutex);
++  pthread_cleanup_push(pts_order_unlock, &pts_order_mutex);
++  spts_gate next;
++  if (samples>0 && bytes_per_frame==4 && timing != NULL)
++    boundary=spts_gate_preview(&pts_gate, timing, &next, &delta);
++  if (boundary>=0) {
++    result=boundary ? pts_boundary_locked() : SPW_OK;
++    if (result==SPW_OK) result=emit_pts_locked(PTS_TIMED, (uint32_t)samples, rtp,
++                                             timing->pts_raw_ns, buf);
++    if (result==SPW_OK) { pts_gate=next; emitted_epoch=pts_epoch; }
++  } else if (pts_writer_ready && !pts_writer.poisoned) {
++    pthread_mutex_lock(&pts_writer.mutex);
++    spw_poison_locked(&pts_writer, SPW_INVALID);
++    pthread_mutex_unlock(&pts_writer.mutex);
++  }
++  pthread_cleanup_pop(1);
++  pts_report_failure(result);
++  if (boundary>0 && result==SPW_OK)
++    inform("SPTS reanchor epoch=%u generation=%" PRIu64 " flags=%u delta_ns=%" PRId64,
++           emitted_epoch, timing->generation, timing->flags, delta);
++  return result==SPW_OK ? 0 : -1;
++}
++
+ static int prepare() {
++  spdiag_bump(SPD_PIPE_PREPARE,1);
++  if (timestamped_pipe) return pts_prepare();
+   int result = 0;
+   // this will leave fd as -1 if a reader hasn't been attached to the pipe
+   // we check that it's not a "real" error though. From the "man 2 open" page:
+@@ -74,6 +206,13 @@
+ static int play(void *buf, int samples, __attribute__((unused)) int sample_type,
+                 __attribute__((unused)) uint32_t timestamp,
+                 __attribute__((unused)) uint64_t playtime) {
++  if (timestamped_pipe) {
++    if (bytes_per_frame != 4 || samples < 0)
++      die("timestamped pipe requires 44100/S16_LE/stereo");
++    emit_pts(sample_type == play_samples_are_timed ? PTS_TIMED : PTS_UNTIMED,
++             (uint32_t)samples,timestamp,playtime,buf);
++    return 0;
++  }
+   // if the file is not open, try to open it.
+   char errorstring[1024];
+   if (fd == -1) {
+@@ -95,10 +234,23 @@
+ }
+ 
+ static void stop(void) {
++  spdiag_bump(SPD_PIPE_STOP,1);
++  if (timestamped_pipe) {
++    enum spw_failure result=SPW_OK;
++    pthread_mutex_lock(&pts_order_mutex);
++    pthread_cleanup_push(pts_order_unlock, &pts_order_mutex);
++    if (pts_writer_ready && !pts_writer.poisoned) result=emit_pts_locked(PTS_STOP,0,0,0,NULL);
++    spts_gate_reset(&pts_gate);
++    pts_started=0;
++    pthread_cleanup_pop(1);
++    pts_report_failure(result);
++  }
++  spdiag_checkpoint(); /* stop-time evidence, including very short sessions */
+   // Don't close the pipe just because a play session has stopped.
+ }
+ 
+ static int init(int argc, char **argv) {
++  int startup_diagnostics=0;
+   //  debug(1, "pipe init");
+   //  const char *str;
+   //  int value;
+@@ -117,6 +269,15 @@
+   parse_audio_options("pipe", (1 << SPS_FORMAT_S16_LE), (1 << SPS_RATE_44100), (1 << 2));
+ #endif
+   if (config.cfg != NULL) {
++    config_lookup_bool(config.cfg, "pipe.startup_diagnostics", &startup_diagnostics);
++    config_lookup_bool(config.cfg, "pipe.timestamped", &timestamped_pipe);
++    config_lookup_bool(config.cfg, "pipe.timestamped_reanchor", &timestamped_reanchor);
++    config_lookup_int(config.cfg, "pipe.timestamped_write_timeout_ms", &timestamped_write_timeout_ms);
++    if (timestamped_write_timeout_ms<1 || timestamped_write_timeout_ms>250)
++      die("SPTS write timeout must be between 1 and 250 milliseconds");
++    if (timestamped_reanchor && !timestamped_pipe)
++      die("SPTS reanchor requires timestamped pipe mode");
++    audio_pipe.play_timed_with_provenance=timestamped_reanchor ? play_timed_with_provenance : NULL;
+     /* Get the Output Pipename. */
+     const char *str;
+     if (config_lookup_non_empty_string(config.cfg, "pipe.name", &str)) {
+@@ -143,13 +304,18 @@
+   if (mkfifo(pipename, 0666) && errno != EEXIST)
+     die("Could not create audio pipe \"%s\"", pipename);
+   umask(oldumask);
++  if (startup_diagnostics && spdiag_start()!=0) warn("SPTS startup diagnostics unavailable");
+ 
+   debug(1, "audio pipe name is \"%s\"", pipename);
+ 
+   return 0;
+ }
+ 
+-static void deinit(void) { safe_socket_close(&fd); }
++static void deinit(void) {
++  spdiag_end();
++  if (pts_writer_ready) { spw_destroy(&pts_writer); pts_writer_ready=0; }
++  safe_socket_close(&fd);
++}
+ 
+ static void help(void) {
+   printf("    Provide the pipe's pathname. The default is \"%s\".\n", default_pipe_name);
+@@ -164,6 +330,11 @@
+ 
+ static int configure(int32_t requested_encoded_format, __attribute__((unused)) char **channel_map) {
+   int response = 0;
++  if (timestamped_pipe &&
++      (FORMAT_FROM_ENCODED_FORMAT(requested_encoded_format) != SPS_FORMAT_S16_LE ||
++       RATE_FROM_ENCODED_FORMAT(requested_encoded_format) != 44100 ||
++       CHANNELS_FROM_ENCODED_FORMAT(requested_encoded_format) != 2))
++    die("timestamped pipe requires explicit 44100/S16_LE/stereo configuration");
+   unsigned int bytes_per_sample =
+       sps_format_sample_size(FORMAT_FROM_ENCODED_FORMAT(requested_encoded_format));
+   if (bytes_per_sample == 0) {
+@@ -184,7 +355,7 @@
+                            .configure = &configure,
+                            .stop = &stop,
+                            .is_running = NULL,
+-                           .flush = NULL,
++                           .flush = &pts_flush, /* sends source epoch, not a DAC flush ACK */
+                            .delay = NULL,
+                            .stats = NULL,
+                            .play = &play,
+--- a/player.c
++++ b/player.c
+@@ -28,6 +28,7 @@
+  * OTHER DEALINGS IN THE SOFTWARE.
+  */
+ 
++#include "spts_diag.h"
+ #include <assert.h>
+ #include <errno.h>
+ #include <fcntl.h>
+@@ -2809,7 +2810,9 @@
+           do_wait = 1;
+         }
+       wait = (conn->ab_buffering || (do_wait != 0) || (!conn->ab_synced));
++      if(wait)spdiag_bump(SPD_PLAYER_WAIT_BUFFER,1);
+     } else {
++      spdiag_bump(SPD_PLAYER_WAIT_CLOCK_OR_FORMAT,1);
+       wait = 1; // keep waiting until the timing information becomes available
+     }
+     if (wait) {
+@@ -3431,6 +3434,7 @@
+ #endif
+ 
+ void player_thread_cleanup_handler(void *arg) {
++  spdiag_bump(SPD_PLAYER_CLEANUP,1);
+   rtsp_conn_info *conn = (rtsp_conn_info *)arg;
+   // debug(1, "Connection %d: player_thread_cleanup_handler start.", conn->connection_number);
+ 
+@@ -3581,7 +3585,34 @@
+   debug(2, "Connection %d: player terminated.", conn->connection_number);
+ }
+ 
++static int output_timed_with_optional_provenance(void *buf, int samples,
++    uint32_t wire_rtp, uint64_t legacy_playtime, uint32_t original_rtp,
++    uint32_t trim_frames, uint32_t packet_rate, rtsp_conn_info *conn) {
++  spdiag_bump(SPD_TIMED_CALLBACK,1);
++  if (config.output->play_timed_with_provenance == NULL)
++    return config.output->play(buf, samples, play_samples_are_timed, wire_rtp, legacy_playtime);
++#ifdef CONFIG_AIRPLAY_2
++  spts_timing timing;
++  if (spts_frame_timing(original_rtp, packet_rate, &timing, conn) != 0) {
++    die("SPTS native timing snapshot unavailable");
++    return -1;
++  }
++  uint32_t output_rate=RATE_FROM_ENCODED_FORMAT(config.current_output_configuration);
++  if (!output_rate) { die("SPTS output rate invalid"); return -1; }
++  timing.trim_ns=((uint64_t)trim_frames * 1000000000) / output_rate;
++  if (timing.pts_raw_ns > UINT64_MAX-timing.trim_ns) { die("SPTS trim time overflow"); return -1; }
++  timing.pts_raw_ns+=timing.trim_ns;
++  /* The trimmed wire RTP uses this queued packet's rate as well. */
++  if (trim_frames) wire_rtp=original_rtp+(uint32_t)(((uint64_t)trim_frames*packet_rate)/output_rate);
++  return config.output->play_timed_with_provenance(buf, samples, wire_rtp, &timing);
++#else
++  die("SPTS native timing requires AirPlay 2");
++  return -1;
++#endif
++}
++
+ void *player_thread_func(void *arg) {
++  spdiag_bump(SPD_PLAYER_START,1);
+   rtsp_conn_info *conn = (rtsp_conn_info *)arg;
+ #ifdef CONFIG_METADATA
+   uint64_t time_of_last_metadata_progress_update =
+@@ -3866,6 +3897,7 @@
+         conn, request_resync); // this has a guaranteed [and needed!] cancellation point
+     request_resync = 0;
+     if (inframe) {
++      spdiag_bump(SPD_PLAYER_FRAME,1);
+ #ifdef CONFIG_METADATA
+       /* Report existing player counters, independently of codec and log verbosity. */
+       report_player_counters(conn);
+@@ -4988,8 +5020,9 @@
+ 
+                     // now, see if we are skipping some or all of these frames
+                     if (frames_to_skip == 0) {
+-                      config.output->play(conn->outbuf, play_samples, play_samples_are_timed,
+-                                          inframe->timestamp, should_be_time);
++                      output_timed_with_optional_provenance(conn->outbuf, play_samples,
++                                          inframe->timestamp, should_be_time, inframe->timestamp,
++                                          0, get_ssrc_rate(inframe->ssrc), conn);
+                       frames_played += play_samples;
+                       conn->total_frames_sent_to_play += play_samples;
+                     } else {
+@@ -5023,9 +5056,9 @@
+                             should_be_time +
+                             ((uint64_t)frames_to_skip * 1000000000) / output_rate;
+ 
+-                        config.output->play(play_starting_point, play_samples - frames_to_skip,
+-                                            play_samples_are_timed, starting_point_timestamp,
+-                                            starting_point_time);
++                        output_timed_with_optional_provenance(play_starting_point, play_samples - frames_to_skip,
++                                            starting_point_timestamp, starting_point_time,
++                                            inframe->timestamp, frames_to_skip, get_ssrc_rate(inframe->ssrc), conn);
+                         conn->total_frames_sent_to_play += (play_samples - frames_to_skip);
+ 
+ 
+@@ -5096,8 +5129,9 @@
+                 uint64_t should_be_time;
+                 frame_to_local_time(inframe->timestamp, &should_be_time, conn);
+                 debug(3, "play frame %u.", inframe->timestamp);
+-                config.output->play(conn->outbuf, play_samples, play_samples_are_timed,
+-                                    inframe->timestamp, should_be_time);
++                output_timed_with_optional_provenance(conn->outbuf, play_samples,
++                                    inframe->timestamp, should_be_time, inframe->timestamp,
++                                    0, get_ssrc_rate(inframe->ssrc), conn);
+                 frames_played += play_samples;
+                 conn->total_frames_sent_to_play += play_samples;
+ #ifdef CONFIG_METADATA
+--- a/player.h
++++ b/player.h
+@@ -468,6 +468,7 @@
+   uint32_t last_anchor_rtptime;
+   uint64_t last_anchor_local_time;
+   uint64_t last_anchor_validity_start_time;
++  spts_map_state spts_native_map; /* reference_time_mutex; optional private output */
+ 
+   // 64-bit extensions of the 32-bit RTP timestamps on a PTP connection -- see
+   // extend_rtp_timestamp() in rtp.c. These four fields are only ever accessed with
+--- /dev/null
++++ b/pts_writer.h
+@@ -0,0 +1,210 @@
++/* Private transactional SPTS-v2 FIFO writer.
++ * Owns fd after successful initialization. No retry/reopen after poison.
++ * Compile with -pthread. Caller retains original, unmodified AirPlay PTS.
++ */
++#ifndef PTS_TRANSACTION_WRITER_H
++#define PTS_TRANSACTION_WRITER_H
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <pthread.h>
++#include <stdint.h>
++#include <stddef.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <sys/uio.h>
++#include <time.h>
++#include <unistd.h>
++
++#define SPW_DEFAULT_WAIT_NS UINT64_C(50000000)
++#define SPW_MAX_WAIT_NS UINT64_C(250000000)
++#define SPW_PRESENTATION_GUARD_NS UINT64_C(20000000)
++
++enum spw_failure {
++  SPW_OK, SPW_INVALID, SPW_POISONED, SPW_LOCK_TIMEOUT, SPW_DEADLINE,
++  SPW_PEER_CLOSED, SPW_IO_ERROR, SPW_CANCELLED
++};
++
++struct spw {
++  pthread_mutex_t mutex;
++  int fd;
++  int poisoned;
++  enum spw_failure failure;
++  size_t bytes_in_failed_record; /* metadata only, never source PCM */
++  size_t transaction_bytes;
++  long pipe_buf;
++};
++
++static uint64_t spw_now(void) {
++  struct timespec ts;
++  clock_gettime(CLOCK_MONOTONIC, &ts);
++  return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
++}
++
++/* Caller supplies now_raw from the SAME source clock as target_raw and a
++ * close bracketing MONOTONIC reading. Conservatively subtract measured bracket
++ * uncertainty from available lead. No changes to the wire PTS are made.
++ * Timed data: min(wait cap, real presentation lead minus guard/uncertainty).
++ * Control/untimed data: fixed wait cap, no fictitious presentation deadline.
++ */
++static uint64_t spw_deadline(uint64_t now_mono, uint64_t now_raw,
++                             uint64_t target_raw, int timed,
++                             uint64_t cap_ns, uint64_t uncertainty_ns) {
++  if (!cap_ns || cap_ns > SPW_MAX_WAIT_NS) return 0;
++  uint64_t allowance = cap_ns;
++  if (timed) {
++    if (uncertainty_ns > UINT64_MAX - SPW_PRESENTATION_GUARD_NS) return 0;
++    uint64_t margin = SPW_PRESENTATION_GUARD_NS + uncertainty_ns;
++    if (target_raw <= now_raw || target_raw - now_raw <= margin) return 0;
++    uint64_t available = target_raw - now_raw - margin;
++    if (available < allowance) allowance = available;
++  }
++  if (now_mono > UINT64_MAX - allowance) return 0;
++  return now_mono + allowance;
++}
++
++static int spw_init(struct spw *w, int fd) {
++  struct stat st;
++  if (fstat(fd, &st) < 0 || !S_ISFIFO(st.st_mode)) return -1;
++  long bound = fpathconf(fd, _PC_PIPE_BUF);
++  if (bound <= 0) return -1;
++  int flags = fcntl(fd, F_GETFL);
++  if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) return -1;
++  memset(w, 0, sizeof(*w));
++  int result = pthread_mutex_init(&w->mutex, NULL);
++  if (result != 0) { errno = result; return -1; }
++  w->fd = fd;
++  w->pipe_buf = bound;
++  return 0;
++}
++
++/* Must hold mutex. Once a transaction fails/cancels, no STOP/FLUSH/audio can
++ * follow it. Closing the only owned write fd makes the reader see EOF after
++ * any buffered bytes; restoration requires a fresh writer/epoch externally.
++ */
++static void spw_poison_locked(struct spw *w, enum spw_failure failure) {
++  if (!w->poisoned) {
++    w->poisoned = 1;
++    w->failure = failure;
++    w->bytes_in_failed_record = w->transaction_bytes;
++    if (w->fd >= 0) close(w->fd);
++    w->fd = -1;
++  }
++}
++
++static void spw_cancel_cleanup(void *arg) {
++  struct spw *w = arg;
++  spw_poison_locked(w, SPW_CANCELLED);
++  pthread_mutex_unlock(&w->mutex);
++}
++
++static void spw_put(uint8_t *p, uint64_t value, unsigned count) {
++  for (unsigned i = 0; i < count; ++i)
++    p[count - i - 1] = (uint8_t)(value >> (8 * i));
++}
++
++/* The caller must block/ignore SIGPIPE before using this pipe API (as the
++ * current receiver does), otherwise OS default termination precedes EPIPE.
++ * Deadline is absolute MONOTONIC and <=250ms from entry, not a renewed timeout
++ * per retry. Large records are never replayed after partial progress.
++ */
++static enum spw_failure spw_send_until(struct spw *w, unsigned kind,
++    uint32_t epoch, uint32_t sequence, uint64_t pts, uint64_t observed,
++    uint32_t frames, uint32_t rtp, const void *pcm, uint64_t deadline) {
++  uint64_t entry = spw_now();
++  if (!deadline || deadline <= entry || deadline - entry > SPW_MAX_WAIT_NS)
++    return SPW_INVALID;
++  int old_cancel;
++  pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_cancel);
++  for (;;) {
++    int locked = pthread_mutex_trylock(&w->mutex);
++    if (locked == 0) break;
++    if (locked != EBUSY) {
++      pthread_setcancelstate(old_cancel, NULL);
++      return SPW_IO_ERROR;
++    }
++    if (spw_now() >= deadline) {
++      pthread_setcancelstate(old_cancel, NULL);
++      return SPW_LOCK_TIMEOUT;
++    }
++    pthread_setcancelstate(old_cancel, NULL);
++    struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000000};
++    nanosleep(&pause, NULL);
++    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
++  }
++  enum spw_failure result = SPW_OK;
++  w->transaction_bytes = 0;
++  pthread_cleanup_push(spw_cancel_cleanup, w);
++  pthread_setcancelstate(old_cancel, NULL);
++  pthread_testcancel();
++  if (w->poisoned || w->fd < 0) {
++    result = SPW_POISONED;
++  } else if (kind < 1 || kind > 4 || frames > 8192 ||
++             (kind == 1 && (!frames || !pts || !pcm)) ||
++             (kind == 2 && frames && !pcm) || (kind >= 3 && frames)) {
++    result = SPW_INVALID;
++    spw_poison_locked(w, result);
++  } else {
++    uint8_t header[40] = {'S','P','T','S',2,(uint8_t)kind,0,4};
++    spw_put(header + 8, epoch, 4); spw_put(header + 12, sequence, 4);
++    spw_put(header + 16, pts, 8); spw_put(header + 24, observed, 8);
++    spw_put(header + 32, frames, 4); spw_put(header + 36, rtp, 4);
++    struct iovec vec[2] = {{header, sizeof(header)}, {(void *)pcm, (size_t)frames * 4}};
++    int count = kind <= 2 && frames ? 2 : 1;
++    int index = 0;
++    while (index < count) {
++      pthread_testcancel();
++      uint64_t now = spw_now();
++      if (now >= deadline) { result = SPW_DEADLINE; break; }
++      /* One writev for header + payload: <=PIPE_BUF is atomic on a pipe. */
++      ssize_t written = writev(w->fd, vec + index, count - index);
++      if (written > 0) {
++        w->transaction_bytes += (size_t)written;
++        size_t advance = (size_t)written;
++        while (index < count && advance >= vec[index].iov_len) {
++          advance -= vec[index].iov_len;
++          ++index;
++        }
++        if (index < count && advance) {
++          vec[index].iov_base = (uint8_t *)vec[index].iov_base + advance;
++          vec[index].iov_len -= advance;
++        }
++        continue;
++      }
++      if (written < 0 && errno == EINTR) continue;
++      if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
++        now = spw_now();
++        if (now >= deadline) { result = SPW_DEADLINE; break; }
++        uint64_t left = deadline - now;
++        int ms = left < UINT64_C(5000000) ? (int)((left + 999999) / 1000000) : 5;
++        struct pollfd poll_fd = {.fd = w->fd, .events = POLLOUT};
++        int ready = poll(&poll_fd, 1, ms);
++        if (ready < 0 && errno == EINTR) continue;
++        if (ready < 0) { result = SPW_IO_ERROR; break; }
++        if (ready > 0 && (poll_fd.revents & (POLLERR | POLLHUP | POLLNVAL))) {
++          result = SPW_PEER_CLOSED; break;
++        }
++        continue;
++      }
++      result = written < 0 && errno == EPIPE ? SPW_PEER_CLOSED : SPW_IO_ERROR;
++      break;
++    }
++    if (result != SPW_OK) spw_poison_locked(w, result);
++  }
++  /* No cancellation window between removing cleanup and unlocking. */
++  pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
++  pthread_cleanup_pop(0);
++  pthread_mutex_unlock(&w->mutex);
++  pthread_setcancelstate(old_cancel, NULL);
++  return result;
++}
++
++/* Only after all producer threads have joined; destruction is not a signal
++ * handler and does not emit STOP. A caller must send STOP successfully first
++ * when the normal lifecycle requires it. */
++static void spw_destroy(struct spw *w) {
++  if (w->fd >= 0) close(w->fd);
++  w->fd = -1;
++  pthread_mutex_destroy(&w->mutex);
++}
++#endif
+--- a/rtp.c
++++ b/rtp.c
+@@ -25,6 +25,7 @@
+  * OTHER DEALINGS IN THE SOFTWARE.
+  */
+ 
++#include "spts_diag.h"
+ #include "rtp.h"
+ #include "common.h"
+ #include "player.h"
+@@ -1385,6 +1386,7 @@
+     }
+   }
+ 
++  spdiag_bump(SPD_ANCHOR_SET,1);
+   conn->anchor_remote_info_is_valid = 1;
+ 
+   // these can be modified if the master clock changes over time
+@@ -1429,6 +1431,7 @@
+     debug(1, "Connection %d: reset_ptp_anchor_info can not lock reference_time_mutex: error %d.",
+           conn->connection_number, rc);
+   conn->anchor_remote_info_is_valid = 0;
++  conn->spts_native_map.invalid = 1;
+   conn->rtp_timestamp_extension_reference_is_valid = 0;
+   if (rc == 0)
+     pthread_mutex_unlock(&conn->reference_time_mutex);
+@@ -1442,13 +1445,17 @@
+ static int get_ptp_anchor_local_time_info_extended(rtsp_conn_info *conn,
+                                                    uint64_t *anchorRTPExtended,
+                                                    uint64_t *anchorLocalTime,
+-                                                   uint64_t *extensionReference) {
++                                                   uint64_t *extensionReference,
++                                                   uint32_t snapshot_timestamp,
++                                                   uint32_t snapshot_rate,
++                                                   spts_timing *snapshot) {
+   int response = clock_no_anchor_info; // no anchor information
++  uint64_t actual_clock_id=0, actual_time_of_sample=0, actual_offset=0, start_of_mastership=0;
++  if (snapshot) memset(snapshot, 0, sizeof(*snapshot));
+   pthread_mutex_lock(&conn->reference_time_mutex);
+   pthread_cleanup_push(mutex_unlock, &conn->reference_time_mutex);
+   if (conn->anchor_remote_info_is_valid != 0) {
+     response = clock_not_valid;
+-    uint64_t actual_clock_id, actual_time_of_sample, actual_offset, start_of_mastership;
+     int64_t clock_change_offset;
+     response = ptp_get_clock_info(&actual_clock_id, &actual_time_of_sample, &actual_offset, &clock_change_offset,
+                                   &start_of_mastership);
+@@ -1546,8 +1553,16 @@
+         *anchorLocalTime = conn->last_anchor_local_time;
+       if (extensionReference != NULL)
+         *extensionReference = conn->rtp_timestamp_extension_reference;
+-    }
+-  }
++      if (snapshot != NULL) {
++        uint64_t frame=extend_rtp_timestamp(snapshot_timestamp, conn->rtp_timestamp_extension_reference);
++        if (spts_capture(&conn->spts_native_map, actual_clock_id, conn->anchor_rtptime_extended,
++                         conn->anchor_time, actual_offset, snapshot_rate, frame, snapshot) != 0)
++          response=clock_not_valid;
++      }
++    }
++  }
++  spdiag_bump(response>=clock_no_anchor_info && response<=clock_not_ready?SPD_PTP_NO_ANCHOR+(unsigned)response:SPD_PTP_OTHER,1);
++  if ((clock_status_t)response != clock_ok) conn->spts_native_map.invalid=1;
+   pthread_cleanup_pop(1); //unlock that mutex
+   return response;
+ }
+@@ -1556,7 +1571,7 @@
+                                    uint64_t *anchorLocalTime) {
+   uint64_t anchor_rtptime_extended = 0;
+   int response = get_ptp_anchor_local_time_info_extended(conn, &anchor_rtptime_extended,
+-                                                         anchorLocalTime, NULL);
++                                                         anchorLocalTime, NULL, 0, 0, NULL);
+   if ((response == clock_ok) && (anchorRTP != NULL))
+     *anchorRTP = (uint32_t)anchor_rtptime_extended;
+   return response;
+@@ -1567,6 +1582,13 @@
+     return 1;
+   else
+     return 0;
++}
++
++int spts_frame_timing(uint32_t timestamp, uint32_t input_rate,
++                      spts_timing *timing, rtsp_conn_info *conn) {
++  if (conn->timing_type != ts_ptp) return -1;
++  return get_ptp_anchor_local_time_info_extended(conn, NULL, NULL, NULL,
++           timestamp, input_rate, timing) == clock_ok ? 0 : -1;
+ }
+ 
+ int frame_to_ptp_local_time(uint32_t timestamp, uint64_t *time, rtsp_conn_info *conn) {
+@@ -1577,7 +1599,7 @@
+   uint32_t rate = conn->input_rate; // it can be changed by the player thread, so take a copy
+   if ((rate != 0) &&
+       (get_ptp_anchor_local_time_info_extended(conn, &anchor_rtptime_extended, &anchor_local_time,
+-                                               &extension_reference) == clock_ok)) {
++                                               &extension_reference, 0, 0, NULL) == clock_ok)) {
+     int64_t frame_difference =
+         extend_rtp_timestamp(timestamp, extension_reference) - anchor_rtptime_extended;
+     int64_t time_difference = frames_to_nanoseconds(frame_difference, rate);
+@@ -1596,7 +1618,7 @@
+   uint64_t anchor_local_time = 0;
+   uint32_t rate = conn->input_rate; // it can be changed by the player thread, so take a copy
+   if ((rate != 0) && (get_ptp_anchor_local_time_info_extended(
+-                          conn, &anchor_rtptime_extended, &anchor_local_time, NULL) == clock_ok)) {
++                          conn, &anchor_rtptime_extended, &anchor_local_time, NULL, 0, 0, NULL) == clock_ok)) {
+     int64_t time_difference = time - anchor_local_time;
+     int64_t frame_difference = nanoseconds_to_frames(time_difference, rate);
+     *frame = (uint32_t)(anchor_rtptime_extended + frame_difference);
+--- a/rtp.h
++++ b/rtp.h
+@@ -26,6 +26,8 @@
+ 
+ #ifdef CONFIG_AIRPLAY_2
+ int have_ptp_timing_information(rtsp_conn_info *conn);
++int spts_frame_timing(uint32_t timestamp, uint32_t input_rate,
++                      spts_timing *timing, rtsp_conn_info *conn);
+ int get_ptp_anchor_local_time_info(rtsp_conn_info *conn, uint32_t *anchorRTP,
+                                    uint64_t *anchorLocalTime);
+ void reset_ptp_anchor_info(rtsp_conn_info *conn);
+--- a/rtsp.c
++++ b/rtsp.c
+@@ -27,6 +27,7 @@
+  * OTHER DEALINGS IN THE SOFTWARE.
+  */
+ 
++#include "spts_diag.h"
+ #include <arpa/inet.h>
+ #include <errno.h>
+ #include <fcntl.h>
+@@ -1437,6 +1438,7 @@
+             ", flushUntilSeq: %" PRIu64 ".",
+             conn->connection_number, flushUntilTS, flushUntilSeq & 0x7fffff);
+       conn->ap2_play_enabled = 0; // stop trying to play audio
++      spdiag_bump(SPD_IMMEDIATE_FLUSH,1);
+ #ifdef CONFIG_METADATA
+       reset_input_bitrate(conn);
+ #endif
+@@ -1562,11 +1564,13 @@
+         send_ssnc_metadata('pres', NULL, 0, 1); // resume -- contains cancellation points
+ #endif
+         conn->ap2_play_enabled = 1;
++        spdiag_bump(SPD_PLAY_ENABLE,1);
+       } else {
+         reset_ptp_anchor_info(conn);
+         ptp_send_control_message_string("P"); // signify play is "P"ausing
+         debug(2, "Connection %d: SETRATEANCHORI Pause playing.", conn->connection_number);
+         conn->ap2_play_enabled = 0;
++        spdiag_bump(SPD_PLAY_DISABLE,1);
+ #ifdef CONFIG_METADATA
+         /* The TCP reader can remain asleep throughout a pause and resume. */
+         reset_input_bitrate(conn);
+@@ -2905,6 +2909,7 @@
+           debug(2, "Connection %d: UDP realtime audio port opened: %u.", conn->connection_number,
+                 conn->local_realtime_audio_port);
+   
++          spdiag_bump(SPD_SETUP_REALTIME,1);
+           named_pthread_create(&conn->rtp_realtime_audio_thread, NULL, &rtp_realtime_audio_receiver,
+                                (void *)conn, "ap2_ra_%d", conn->connection_number);
+           plist_dict_set_item(stream0dict, "type", plist_new_uint(96));
+@@ -2942,6 +2947,7 @@
+                 conn->connection_number, err);
+           }
+   
++          spdiag_bump(SPD_SETUP_BUFFERED,1);
+           listen(conn->buffered_audio_socket, 128); // ensure it's open before telling the client
+   
+           debug(2, "Connection %d: TCP Buffered Audio port opened: %u.", conn->connection_number,
+@@ -4046,6 +4052,7 @@
+ }
+ 
+ void rtsp_conversation_thread_cleanup_function(void *arg) {
++  spdiag_bump(SPD_RTSP_CLOSE,1);
+   rtsp_conn_info *conn = (rtsp_conn_info *)arg;
+   if (conn != NULL) {
+     int oldState;
+@@ -4221,6 +4228,7 @@
+     die("Connection %d: error %d initialising event_sender_mutex.", conn->connection_number, rc);
+ #endif
+ 
++  spdiag_bump(SPD_RTSP_OPEN,1);
+   // nothing before this is cancellable
+   pthread_cleanup_push(rtsp_conversation_thread_cleanup_function, (void *)conn);
+ 
+@@ -4249,11 +4257,13 @@
+     pthread_mutex_unlock(&conns_lock);
+ 
+     reply = rtsp_read_request(conn, &req);
++    spdiag_bump(reply==rtsp_read_request_response_ok?SPD_RTSP_READ_OK:SPD_RTSP_READ_BAD,1);
+     if (reply == rtsp_read_request_response_ok) {
+       pthread_cleanup_push(msg_cleanup_function, (void *)&req);
+       resp = msg_init();
+       pthread_cleanup_push(msg_cleanup_function, (void *)&resp);
+       resp->respcode = 501; // Not Implemented
++      spdiag_rtsp(req->method,req->path,0,0,0);
+       int dl = debug_level;
+       // if ((strcmp(req->method, "OPTIONS") == 0) ||
+       //    (strcmp(req->method, "POST") ==
+@@ -4336,6 +4346,9 @@
+       debug_log_rtsp_message(dl, NULL, resp);
+       // if (conn->stop == 0) {
+       int err = msg_write_response(conn, resp);
++      spdiag_bump(err?SPD_RTSP_WRITE_FAILED:SPD_RTSP_WRITE_OK,1);
++      spdiag_rtsp(req->method,req->path,resp->respcode,
++         conn->airplay_stream_type==buffered_stream?3:(conn->airplay_stream_type==realtime_stream?2:1),err);
+       if (err) {
+         debug(1,
+               "Connection %d: Unable to write an RTSP message response. Terminating the "
+--- /dev/null
++++ b/spts_diag.c
+@@ -0,0 +1,82 @@
++#include "spts_diag.h"
++#include "utilities/debug.h"
++#include <pthread.h>
++#include <string.h>
++#include <time.h>
++#include <inttypes.h>
++#define SPD_EVENTS 256
++#define SPD_SECONDS 180
++#define SPD_MAX_REPORTS 192
++_Atomic int spdiag_enabled;
++_Atomic uint64_t spdiag_counts[SPD_COUNT];
++static _Atomic uint64_t events[SPD_EVENTS], event_reserved;
++static pthread_mutex_t report_mutex=PTHREAD_MUTEX_INITIALIZER;
++static pthread_t reporter;
++static int reporter_started;
++static unsigned emitted, reports;
++static const char *const methods[]={"OPTIONS","ANNOUNCE","FLUSH","TEARDOWN","SETUP","GET_PARAMETER","SET_PARAMETER","RECORD","GET","POST","SETPEERS","SETPEERSX","SETRATEANCHORTI","FLUSHBUFFERED","SETRATE"};
++static const char *const routes[]={"/info","/pair-setup","/pair-verify","/pair-add","/pair-remove","/pair-list","/pair-pin-start","/fp-setup","/configure","/feedback","/command","/audioMode"};
++/* 0: request/no response yet; 1..12 exact allowlisted response; 13: other. */
++static const int statuses[]={200,400,401,403,451,453,456,470,500,501,503,454};
++static unsigned token(const char *value,const char *const *table,unsigned count) {
++ if(!value || strnlen(value,64)==64)return 0;
++ for(unsigned i=0;i<count;i++)if(!strcmp(value,table[i]))return i+1;
++ return 0;
++}
++void spdiag_rtsp(const char *method,const char *path,int code,int stream,int write_failed) {
++ if(!atomic_load_explicit(&spdiag_enabled,memory_order_relaxed))return;
++ unsigned m=token(method,methods,sizeof(methods)/sizeof(*methods));
++ unsigned r=token(path,routes,sizeof(routes)/sizeof(*routes));
++ unsigned c=code==0?0:13;
++ for(unsigned i=0;i<sizeof(statuses)/sizeof(*statuses);i++)if(code==statuses[i])c=i+1;
++ /* stream is a fixed caller enum: 0 unknown, 1 classic, 2 realtime, 3 buffered. */
++ unsigned s=stream>=0&&stream<=3?(unsigned)stream:0;
++ uint64_t packed=UINT64_C(1)<<63 | m | (r<<8) | (c<<16) | (s<<24) | ((write_failed!=0)<<28);
++ uint64_t slot=atomic_fetch_add_explicit(&event_reserved,1,memory_order_relaxed);
++ if(slot<SPD_EVENTS)atomic_store_explicit(&events[slot],packed,memory_order_release);
++}
++static void unlock_report(void *v){pthread_mutex_unlock(v);}
++void spdiag_checkpoint(void) {
++ if(!reporter_started || pthread_mutex_trylock(&report_mutex))return;
++ pthread_cleanup_push(unlock_report,&report_mutex);
++ if(reports<SPD_MAX_REPORTS) {
++  unsigned tick=++reports;
++  for(unsigned budget=0;budget<SPD_EVENTS && emitted<SPD_EVENTS;budget++) {
++   uint64_t e=atomic_load_explicit(&events[emitted],memory_order_acquire);
++   if(!e)break;
++   inform("SPTS startup rtsp seq=%u method=%u route=%u status=%u stream=%u write_failed=%u",
++          ++emitted,(unsigned)(e&255),(unsigned)((e>>8)&255),(unsigned)((e>>16)&255),
++          (unsigned)((e>>24)&15),(unsigned)((e>>28)&1));
++  }
++  for(unsigned g=0;g<4;g++) {
++   uint64_t c[16];for(unsigned i=0;i<16;i++)c[i]=atomic_load_explicit(&spdiag_counts[g*16+i],memory_order_relaxed);
++   inform("SPTS startup counts tick=%u group=%u a=%" PRIu64 " b=%" PRIu64 " c=%" PRIu64 " d=%" PRIu64 " e=%" PRIu64 " f=%" PRIu64 " g=%" PRIu64 " h=%" PRIu64 " i=%" PRIu64 " j=%" PRIu64 " k=%" PRIu64 " l=%" PRIu64 " m=%" PRIu64 " n=%" PRIu64 " o=%" PRIu64 " p=%" PRIu64,
++          tick,g,c[0],c[1],c[2],c[3],c[4],c[5],c[6],c[7],c[8],c[9],c[10],c[11],c[12],c[13],c[14],c[15]);
++  }
++ }
++ pthread_cleanup_pop(1);
++}
++static void *report_main(void *unused) {
++ (void)unused;
++ for(unsigned i=0;i<SPD_SECONDS && atomic_load(&spdiag_enabled);i++) {
++  struct timespec t={1,0};nanosleep(&t,NULL);
++  spdiag_checkpoint();
++ }
++ atomic_store(&spdiag_enabled,0);
++ return NULL;
++}
++int spdiag_start(void) {
++ if(reporter_started)return 0;
++ /* Init is called once before RTSP threads. No reset/reallocation while active. */
++ atomic_store(&spdiag_enabled,1);reporter_started=1;
++ if(pthread_create(&reporter,NULL,report_main,NULL)) {
++  reporter_started=0;atomic_store(&spdiag_enabled,0);return -1;
++ }
++ inform("SPTS startup enabled window_s=180 event_limit=256 report_limit=192");
++ return 0;
++}
++void spdiag_end(void) {
++ if(!reporter_started)return;
++ atomic_store(&spdiag_enabled,0);pthread_join(reporter,NULL);
++ spdiag_checkpoint();reporter_started=0;
++}
+--- /dev/null
++++ b/spts_diag.h
+@@ -0,0 +1,85 @@
++/* Private opt-in bounded startup diagnostics. No caller strings are retained.
++ * Audio/timing hooks perform atomic increments only; a separate thread reports. */
++#ifndef SPTS_DIAG_H
++#define SPTS_DIAG_H
++#include <stdint.h>
++#include <stdatomic.h>
++enum spdiag_key {
++ SPD_RTSP_OPEN=0,
++ SPD_RTSP_CLOSE=1,
++ SPD_RTSP_READ_OK=2,
++ SPD_RTSP_READ_BAD=3,
++ SPD_RTSP_WRITE_OK=4,
++ SPD_RTSP_WRITE_FAILED=5,
++ SPD_SETUP_BUFFERED=6,
++ SPD_SETUP_REALTIME=7,
++ SPD_ANCHOR_SET=8,
++ SPD_PLAY_ENABLE=9,
++ SPD_PLAY_DISABLE=10,
++ SPD_IMMEDIATE_FLUSH=11,
++ SPD_BUFFERED_THREAD_START=12,
++ SPD_BUFFERED_THREAD_STOP=13,
++ SPD_TCP_ACCEPT_WAIT=14,
++ SPD_TCP_ACCEPT_OK=15,
++ SPD_TCP_ACCEPT_FAILED=16,
++ SPD_TCP_READ_CALLS=17,
++ SPD_TCP_READ_BYTES=18,
++ SPD_TCP_EOF=19,
++ SPD_TCP_READ_FAILED=20,
++ SPD_INITIAL_PTP_WAIT=21,
++ SPD_INITIAL_PTP_READY=22,
++ SPD_BLOCK_READ=23,
++ SPD_BLOCK_RECOGNIZED=24,
++ SPD_BLOCK_UNKNOWN=25,
++ SPD_BLOCK_WAIT_DISABLED=26,
++ SPD_BLOCK_WAIT_EARLY=27,
++ SPD_BLOCK_WAIT_CLOCK=28,
++ SPD_DECRYPT_OK=29,
++ SPD_DECRYPT_FAILED=30,
++ SPD_DECRYPT_NO_KEY=31,
++ SPD_BLOCK_LATE=32,
++ SPD_PLAYER_SUBMIT=33,
++ SPD_PLAYER_SUBMIT_NONZERO=34,
++ SPD_PLAYER_START=35,
++ SPD_PLAYER_CLEANUP=36,
++ SPD_PLAYER_WAIT_CLOCK_OR_FORMAT=37,
++ SPD_PLAYER_WAIT_BUFFER=38,
++ SPD_PLAYER_FRAME=39,
++ SPD_TIMED_CALLBACK=40,
++ SPD_PIPE_PREPARE=41,
++ SPD_PIPE_FLUSH=42,
++ SPD_PIPE_STOP=43,
++ SPD_WIRE_TIMED_OK=44,
++ SPD_WIRE_UNTIMED_OK=45,
++ SPD_PTP_NO_ANCHOR=46,
++ SPD_PTP_OK=47,
++ SPD_PTP_SERVICE_UNAVAILABLE=48,
++ SPD_PTP_ACCESS_ERROR=49,
++ SPD_PTP_DATA_UNAVAILABLE=50,
++ SPD_PTP_NO_MASTER=51,
++ SPD_PTP_VERSION_MISMATCH=52,
++ SPD_PTP_NOT_SYNCHRONIZED=53,
++ SPD_PTP_NOT_VALID=54,
++ SPD_PTP_NOT_READY=55,
++ SPD_PTP_OTHER=56,
++ SPD_COUNT=64
++};
++#if defined(CONFIG_PIPE) && !defined(SPTS_DIAG_TEST_STUB)
++extern _Atomic int spdiag_enabled;
++extern _Atomic uint64_t spdiag_counts[SPD_COUNT];
++static inline void spdiag_bump(unsigned key,uint64_t amount) {
++ if(key<SPD_COUNT && atomic_load_explicit(&spdiag_enabled,memory_order_relaxed))
++  atomic_fetch_add_explicit(&spdiag_counts[key],amount,memory_order_relaxed);
++}
++int spdiag_start(void);
++void spdiag_end(void);
++void spdiag_checkpoint(void);
++void spdiag_rtsp(const char *method,const char *path,int code,int stream,int write_failed);
++#else
++static inline void spdiag_bump(unsigned k,uint64_t n){(void)k;(void)n;}
++static inline int spdiag_start(void){return 0;}
++static inline void spdiag_end(void){}
++static inline void spdiag_checkpoint(void){}
++static inline void spdiag_rtsp(const char *m,const char *p,int c,int s,int e){(void)m;(void)p;(void)c;(void)s;(void)e;}
++#endif
++#endif
+--- /dev/null
++++ b/spts_timing.h
+@@ -0,0 +1,114 @@
++#ifndef SPTS_TIMING_H
++#define SPTS_TIMING_H
++#include <stdint.h>
++#include <string.h>
++#include <limits.h>
++
++enum { SPTS_INITIAL=1, SPTS_ANCHOR=2, SPTS_OFFSET=4, SPTS_MASTER=8,
++       SPTS_RECOVERY=16, SPTS_RATE=32 };
++typedef struct {
++  uint64_t generation, anchor_frame, anchor_raw_ns, frame, pts_raw_ns, trim_ns;
++  uint32_t input_rate, flags;
++} spts_timing;
++
++typedef struct {
++  uint64_t generation, clock_id, anchor_frame, remote_ns, offset;
++  uint32_t rate, flags;
++  int seen, invalid;
++} spts_map_state;
++
++static inline int spts_project(uint64_t frame, uint64_t anchor,
++                               uint64_t anchor_ns, uint32_t rate,
++                               uint64_t *result) {
++  if (!rate) return -1;
++  int64_t difference = (int64_t)(frame - anchor);
++  __int128 projected = (__int128)anchor_ns + (__int128)difference * 1000000000 / rate;
++  if (projected <= 0 || projected > UINT64_MAX) return -1;
++  *result = (uint64_t)projected;
++  return 0;
++}
++
++/* Call with the native reference_time_mutex held. All arguments come from
++ * the same successful native PTP lookup, never from inferred output deltas. */
++static inline int spts_capture(spts_map_state *state, uint64_t clock_id,
++    uint64_t anchor, uint64_t remote_ns, uint64_t offset, uint32_t rate,
++    uint64_t frame, spts_timing *out) {
++  if (rate != 44100 && rate != 48000) return -1;
++  uint32_t flags = 0;
++  if (!state->seen) flags |= SPTS_INITIAL;
++  else {
++    if (state->anchor_frame != anchor || state->remote_ns != remote_ns) flags |= SPTS_ANCHOR;
++    if (state->offset != offset) flags |= SPTS_OFFSET;
++    if (state->clock_id != clock_id) flags |= SPTS_MASTER;
++    if (state->rate != rate) flags |= SPTS_RATE;
++    if (state->invalid) flags |= SPTS_RECOVERY;
++  }
++  if (flags) {
++    if (state->generation == UINT64_MAX) return -1;
++    ++state->generation;
++    state->flags = flags;
++  }
++  /* Native clock offsets are modulo-2^64 signed differences. Preserve the
++   * same subtraction as rtp.c; the resulting local time must project validly. */
++  uint64_t anchor_ns = remote_ns - offset;
++  uint64_t pts;
++  if (spts_project(frame, anchor, anchor_ns, rate, &pts)) return -1;
++  *out = (spts_timing){.generation=state->generation, .anchor_frame=anchor,
++    .anchor_raw_ns=anchor_ns, .frame=frame, .pts_raw_ns=pts,
++    .input_rate=rate, .flags=state->flags};
++  state->clock_id=clock_id; state->anchor_frame=anchor; state->remote_ns=remote_ns;
++  state->offset=offset; state->rate=rate; state->seen=1; state->invalid=0;
++  return 0;
++}
++
++typedef struct {
++  spts_timing previous;
++  uint64_t window_frame, window_pts, window_trim;
++  int seen;
++} spts_gate;
++
++static inline void spts_gate_reset(spts_gate *gate) { memset(gate, 0, sizeof(*gate)); }
++
++/* Preview only. Commit the returned next state AFTER complete FLUSH+TIMED
++ * writes. Return 1 for an ordered boundary, 0 for continuity, -1 for invalid
++ * or unproven timing. This is private adapter policy, not an AirPlay limit. */
++static inline int spts_gate_preview(const spts_gate *gate, const spts_timing *now,
++                                    spts_gate *next, int64_t *delta_out) {
++  if (!now->generation || (now->input_rate != 44100 && now->input_rate != 48000)) return -1;
++  uint64_t exact;
++  if (spts_project(now->frame, now->anchor_frame, now->anchor_raw_ns, now->input_rate, &exact)
++      || exact > UINT64_MAX-now->trim_ns || exact+now->trim_ns != now->pts_raw_ns) return -1;
++  int boundary=0;
++  int64_t delta=0;
++  if (gate->seen) {
++    const spts_timing *old=&gate->previous;
++    if (now->generation < old->generation) return -1;
++    int changed = now->anchor_frame != old->anchor_frame || now->anchor_raw_ns != old->anchor_raw_ns
++                  || now->input_rate != old->input_rate;
++    if (changed && (now->generation == old->generation || !now->flags)) return -1;
++    int rate_changed = now->input_rate != old->input_rate;
++    if (!rate_changed && (int64_t)(now->frame-old->frame) <= 0) return -1;
++    uint64_t old_projection;
++    if (spts_project(now->frame, old->anchor_frame, old->anchor_raw_ns, old->input_rate, &old_projection)
++        || old_projection > UINT64_MAX-now->trim_ns) return -1;
++    delta=(int64_t)(now->pts_raw_ns-(old_projection+now->trim_ns));
++    uint64_t window_projection;
++    if (gate->window_pts < gate->window_trim ||
++        spts_project(now->frame, gate->window_frame, gate->window_pts-gate->window_trim,
++                     old->input_rate, &window_projection) || window_projection > UINT64_MAX-now->trim_ns) return -1;
++    int64_t rolling=(int64_t)(now->pts_raw_ns-(window_projection+now->trim_ns));
++    int new_revision=now->generation != old->generation;
++    boundary = rate_changed || (new_revision && (now->flags & (SPTS_MASTER|SPTS_RECOVERY|SPTS_RATE)))
++      || delta > 1000000 || delta < -1000000 || rolling > 2000000 || rolling < -2000000
++      || now->pts_raw_ns <= old->pts_raw_ns;
++    if (boundary && (!new_revision || !now->flags)) return -1;
++  }
++  *next=*gate;
++  if (!gate->seen || boundary || now->pts_raw_ns-gate->window_pts >= UINT64_C(1000000000)) {
++    next->window_frame=now->frame; next->window_pts=now->pts_raw_ns; next->window_trim=now->trim_ns;
++  }
++  next->seen=1; next->previous=*now;
++  *delta_out=delta;
++  return boundary;
++}
++#endif
+--- a/utilities/buffered_read.c
++++ b/utilities/buffered_read.c
+@@ -27,6 +27,7 @@
+  * OTHER DEALINGS IN THE SOFTWARE.
+  */
+ 
++#include "spts_diag.h"
+ #include "buffered_read.h"
+ #include "common.h"
+ #include <pthread.h>
+@@ -109,7 +110,9 @@
+   memset(&remote_addr, 0, sizeof(remote_addr));
+   socklen_t addr_size = sizeof(remote_addr);
+   int finished = 0;
++  spdiag_bump(SPD_TCP_ACCEPT_WAIT,1);
+   int fd = accept(descriptor->sock_fd, (struct sockaddr *)&remote_addr, &addr_size);
++  spdiag_bump(fd>=0?SPD_TCP_ACCEPT_OK:SPD_TCP_ACCEPT_FAILED,1);
+   // debug(1, "buffered_tcp_reader: the client has opened a buffered audio link.");
+   // intptr_t pfd = fd;
+   pthread_cleanup_push(socket_cleanup, (void *)&fd);
+@@ -148,6 +151,9 @@
+     if (descriptor->buffer_occupancy == 0)
+       debug(4, "recv of up to %zd bytes with an buffer empty.", bytes_to_request);
+     nread = recv(fd, descriptor->eoq, bytes_to_request, 0);
++    spdiag_bump(SPD_TCP_READ_CALLS,1);
++    if(nread>0)spdiag_bump(SPD_TCP_READ_BYTES,(uint64_t)nread);
++    else spdiag_bump(nread==0?SPD_TCP_EOF:SPD_TCP_READ_FAILED,1);
+     // debug(1, "Received %zu bytes for a buffer size of %zd bytes.",nread, descriptor->buffer_occupancy + nread);
+     if (pthread_mutex_lock(&descriptor->mutex) != 0)
+       debug(1, "problem with not empty mutex");

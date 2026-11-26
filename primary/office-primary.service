@@ -1,0 +1,38 @@
+[Unit]
+Description=Office standalone AirPlay and native Sonos grouping
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+After=network-online.target avahi-daemon.service play3-airplay-clock.service
+Requires=avahi-daemon.service play3-airplay-clock.service
+
+[Service]
+Type=simple
+User=play3-airplay
+Group=play3-airplay
+UMask=0077
+StateDirectory=office-primary
+StateDirectoryMode=0700
+WorkingDirectory=/opt/office-primary
+ExecCondition=/usr/bin/python3 -I -S -B /opt/office-primary/launch.py --config /etc/office-primary/config.json can-start
+ExecStartPre=/usr/bin/python3 -I -S -B /opt/office-primary/launch.py --config /etc/office-primary/config.json validate
+ExecStart=/usr/bin/python3 -I -S -B /opt/office-primary/launch.py --config /etc/office-primary/config.json run
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=45
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/office-primary
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=
+MemoryMax=128M
+TasksMax=64
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

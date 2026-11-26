@@ -1,0 +1,107 @@
+{
+  "build_inputs_and_scripts": {
+    ".dockerignore": {
+      "identical_to_tested_recipe": true,
+      "sha256": "62cf4859ef2c0e5c0a6a329f445c45c242e9e50db27889145db86a96d6409a6a"
+    },
+    ".gitignore": {
+      "identical_to_tested_recipe": true,
+      "sha256": "4058b794400d56458905de20297022c8ae789872460e54082d6cb8d98abfb072"
+    },
+    "Dockerfile": {
+      "identical_to_tested_recipe": true,
+      "sha256": "7a2f73e1bc8cca0a1343fa34028b17b97d5e5226339e3f9c046a2a1c84d4a42d"
+    },
+    "LICENSE": {
+      "identical_to_tested_recipe": true,
+      "sha256": "af5575361fce9f79a8907210674fabfc28a726e1297023396030e8fa9edc7d07"
+    },
+    "NOTICES.md": {
+      "identical_to_tested_recipe": true,
+      "sha256": "ac4a0fd5ced50451fa6c77d0944f5a689e203b73aa1ff4a39550146e6df1d8a8"
+    },
+    "build-container.sh": {
+      "identical_to_tested_recipe": true,
+      "sha256": "94c8825c9384191e3ab24e0b3f5ebc33ee31ac9643390396590023e2e385608a"
+    },
+    "build-packages.txt": {
+      "identical_to_tested_recipe": true,
+      "sha256": "49dd629db35d411dca58ec6fe53a93e1803f792caf95ad1b70a7c18e627687d7"
+    },
+    "build.py": {
+      "identical_to_tested_recipe": true,
+      "sha256": "a66e0f7c0e6753786538d9dc689587c8439ea56492aeb62848bbe6270eb54c8f"
+    },
+    "check-observer.py": {
+      "identical_to_tested_recipe": true,
+      "sha256": "61368a2a2611d189a37dca602cce52b753e414b77a50db86bd9035f1cba9f851"
+    },
+    "fetch-source.py": {
+      "identical_to_tested_recipe": true,
+      "sha256": "494aae08b107037c9aaaf644b2e775ef2fb16d2b473be5062c199cc7cec257b0"
+    },
+    "patches/01-startup.patch": {
+      "identical_to_tested_recipe": true,
+      "sha256": "a819a3cbea8f0a2d3cf26a4dec58b908a63ad121d48e2302ee91705825d366dc"
+    },
+    "patches/02-observer.patch": {
+      "identical_to_tested_recipe": true,
+      "sha256": "5a6997542bf5f386b5aeedf7a8d258912e04795b88df270ab3a45305fca44fce"
+    },
+    "patches/03-volume.patch": {
+      "identical_to_tested_recipe": true,
+      "sha256": "9ed98ec77431629623262c4fb2878d3f4afc3f9149f5b4f317d6855a9d0e5500"
+    },
+    "runtime-packages.txt": {
+      "identical_to_tested_recipe": true,
+      "sha256": "e3c01509e354eef453516b51695903d0039d52234943553be12fe65da6ce490e"
+    },
+    "source.json": {
+      "identical_to_tested_recipe": true,
+      "sha256": "f6e445eb25d10bc52ca972e898c9443629b0c1a0fda7f4913223ed4507f5f6cb"
+    },
+    "verify-system.py": {
+      "identical_to_tested_recipe": true,
+      "sha256": "8f9f8753a11d95b3e28679d37816b2740d9959156a04d3f6c0c2ebefb263c903"
+    }
+  },
+  "changed_scope": "documentation and removal of mixed daemon configuration only",
+  "historical_recipe_verification": true,
+  "inherited_build_verification": {
+    "byte_identical_receivers": true,
+    "clean_builds": 2,
+    "libconfig_package": "libconfig11:arm64",
+    "libconfig_version": "1.7.3-2",
+    "observer": {
+      "connection_volume_generations_verified": 3,
+      "event_bytes": 88,
+      "events": 11,
+      "kernel_pid_uid_gid_verified": true,
+      "live_playback_verified": false,
+      "spse_version": 2
+    },
+    "package_sha256": "d1c7cf833b21df577682865a8867b8124263ed8ef418550d413bc75ed40830ed",
+    "r8_trusted_elf_sha256": "005b647d18d14691bb7747acfd74cce42635f0a20372e58e74c3fcb412b42765",
+    "receiver_bytes": 712752,
+    "receiver_sha256": "224ddcaecd858a5fed786764a377d18d78534b6c0f33a1ece701253e42221d18",
+    "resolved_shared_libraries": 108,
+    "runtime_package_count": 11,
+    "source_license_header_files": 80,
+    "trusted_and_rebuilt_system_loader_checks_passed": true
+  },
+  "live_primary_verified": false,
+  "no_live_changes_by_packaging_task": true,
+  "product_configuration_included": false,
+  "python_syntax_passed": true,
+  "release_receiver": {
+    "patch_count": 4,
+    "receiver_bytes": 712656,
+    "receiver_sha256": "f7896a553373631492f3148a45ae77f31d5e22a77436771f526c19430cac060a",
+    "resolved_shared_libraries": 108,
+    "version": "1.2.0"
+  },
+  "revision": "shared-receiver-branch-split",
+  "shell_syntax_passed": true,
+  "sonos_python_modules_included": false,
+  "version": 1
+}

@@ -1,0 +1,122 @@
+--- a/audio_pipe.c
++++ b/audio_pipe.c
+@@ -62,13 +62,22 @@
+ static pthread_mutex_t pts_order_mutex = PTHREAD_MUTEX_INITIALIZER;
+ extern audio_output audio_pipe;
+ 
+-static void pts_order_unlock(void *arg) { pthread_mutex_unlock(arg); }
++/* Finish a deadline-bounded record and its epoch/sequence state before a
++ * player-stop cancellation can run. Mutex acquisition is not a cancellation
++ * point; restore cancellation only after releasing the ordering mutex. */
++static int pts_begin_transaction(void) {
++  int previous;
++  pthread_mutex_lock(&pts_order_mutex);
++  pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &previous);
++  return previous;
++}
+ 
+ /* Called only under pts_order_mutex, including epoch/sequence allocation.
+  * A failed writer remains closed/poisoned; cleanup never appends a record. */
+ static enum spw_failure emit_pts_locked(unsigned kind, uint32_t frames, uint32_t rtp,
+                                          uint64_t target, const void *pcm) {
+-  if (!pts_writer_ready || pts_writer.poisoned) return SPW_POISONED;
++  if (!pts_writer_ready) return SPW_POISONED;
++  if (pts_writer.poisoned) return pts_writer.failure;
+   if (pts_sequence == UINT32_MAX || (kind <= PTS_UNTIMED && !pts_started)) {
+     pthread_mutex_lock(&pts_writer.mutex);
+     spw_poison_locked(&pts_writer, SPW_INVALID);
+@@ -113,30 +122,34 @@
+         pts_writer_ready ? pts_writer.bytes_in_failed_record : 0);
+ }
+ 
++static void pts_end_transaction(enum spw_failure result, int previous) {
++  /* A stored pipe failure is immutable. Report it before delivering any
++   * pending cancellation so the launcher can retain the original cause. */
++  pthread_mutex_unlock(&pts_order_mutex);
++  pts_report_failure(result);
++  pthread_setcancelstate(previous, NULL);
++}
++
+ static void pts_flush(void) {
+   spdiag_bump(SPD_PIPE_FLUSH,1);
+   if (!timestamped_pipe) return;
+   enum spw_failure result=SPW_OK;
+-  pthread_mutex_lock(&pts_order_mutex);
+-  pthread_cleanup_push(pts_order_unlock, &pts_order_mutex);
++  int previous=pts_begin_transaction();
+   if (pts_writer_ready && !pts_writer.poisoned) result=pts_boundary_locked();
+-  pthread_cleanup_pop(1);
+-  pts_report_failure(result);
++  pts_end_transaction(result, previous);
+ }
+ 
+ static int pts_prepare(void) {
+   enum spw_failure result=SPW_OK;
+-  pthread_mutex_lock(&pts_order_mutex);
+-  pthread_cleanup_push(pts_order_unlock, &pts_order_mutex);
++  int previous=pts_begin_transaction();
+   if (!pts_writer_ready) {
+     int pipe_fd=try_to_open_pipe_for_writing(pipename);
+     if (pipe_fd < 0) result=SPW_PEER_CLOSED;
+     else if (spw_init(&pts_writer, pipe_fd) != 0) { close(pipe_fd); result=SPW_IO_ERROR; }
+     else pts_writer_ready=1;
+   }
+-  if (result==SPW_OK) result=pts_writer.poisoned ? SPW_POISONED : pts_boundary_locked();
+-  pthread_cleanup_pop(1);
+-  pts_report_failure(result);
++  if (result==SPW_OK) result=pts_writer.poisoned ? pts_writer.failure : pts_boundary_locked();
++  pts_end_transaction(result, previous);
+   return result==SPW_OK ? 0 : -1;
+ }
+ 
+@@ -145,12 +158,10 @@
+   int64_t raw_target=kind==PTS_TIMED ?
+       (int64_t)playtime-(int64_t)(config.audio_backend_latency_offset*1e9) : 0;
+   enum spw_failure result=SPW_INVALID;
+-  pthread_mutex_lock(&pts_order_mutex);
+-  pthread_cleanup_push(pts_order_unlock, &pts_order_mutex);
++  int previous=pts_begin_transaction();
+   if (raw_target >= 0)
+     result=emit_pts_locked(kind, frames, rtp, (uint64_t)raw_target, pcm);
+-  pthread_cleanup_pop(1);
+-  pts_report_failure(result);
++  pts_end_transaction(result, previous);
+ }
+ 
+ static int play_timed_with_provenance(void *buf, int samples, uint32_t rtp,
+@@ -159,8 +170,7 @@
+   int boundary=-1;
+   int64_t delta=0;
+   uint32_t emitted_epoch=0;
+-  pthread_mutex_lock(&pts_order_mutex);
+-  pthread_cleanup_push(pts_order_unlock, &pts_order_mutex);
++  int previous=pts_begin_transaction();
+   spts_gate next;
+   if (samples>0 && bytes_per_frame==4 && timing != NULL)
+     boundary=spts_gate_preview(&pts_gate, timing, &next, &delta);
+@@ -174,8 +184,7 @@
+     spw_poison_locked(&pts_writer, SPW_INVALID);
+     pthread_mutex_unlock(&pts_writer.mutex);
+   }
+-  pthread_cleanup_pop(1);
+-  pts_report_failure(result);
++  pts_end_transaction(result, previous);
+   if (boundary>0 && result==SPW_OK)
+     inform("SPTS reanchor epoch=%u generation=%" PRIu64 " flags=%u delta_ns=%" PRId64,
+            emitted_epoch, timing->generation, timing->flags, delta);
+@@ -241,13 +250,11 @@
+   spdiag_bump(SPD_PIPE_STOP,1);
+   if (timestamped_pipe) {
+     enum spw_failure result=SPW_OK;
+-    pthread_mutex_lock(&pts_order_mutex);
+-    pthread_cleanup_push(pts_order_unlock, &pts_order_mutex);
++    int previous=pts_begin_transaction();
+     if (pts_writer_ready && !pts_writer.poisoned) result=emit_pts_locked(PTS_STOP,0,0,0,NULL);
+     spts_gate_reset(&pts_gate);
+     pts_started=0;
+-    pthread_cleanup_pop(1);
+-    pts_report_failure(result);
++    pts_end_transaction(result, previous);
+   }
+   spdiag_checkpoint(); /* stop-time evidence, including very short sessions */
+   // Don't close the pipe just because a play session has stopped.

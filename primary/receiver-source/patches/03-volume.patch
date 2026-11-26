@@ -1,0 +1,120 @@
+--- a/session_observer.c
++++ b/session_observer.c
+@@ -6,6 +6,8 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <limits.h>
++#include <math.h>
++#include <ctype.h>
+ #include <pthread.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -15,11 +17,12 @@
+ #include <unistd.h>
+ 
+ enum { LIVE=1, GID=2, SETUP=4, SUPPORTED=8, BROKEN=16 };
+-enum { HELLO=1, BEGIN=2, ACCEPT=3, FRAME=4, END=5, FAULT=6 };
++enum { HELLO=1, BEGIN=2, ACCEPT=3, FRAME=4, END=5, FAULT=6, VOLUME=7 };
+ static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
+ static int channel=-1, initialized=0;
+ static const void *owner;
+ static const void *pending_owner;
++static const void *pending_volume_owner;
+ static unsigned char pending_group[16];
+ static int pending_valid,pending_accepted;
+ static unsigned flags;
+@@ -27,6 +30,8 @@
+ static uint32_t epoch,first_sequence,sequence,kind,frames,rtp;
+ static uint64_t pts;
+ static unsigned char group[16];
++static int32_t volume_milli,pending_volume_milli;
++static uint32_t volume_revision,pending_volume_revision;
+ 
+ static void u32(unsigned char *p,uint32_t v) {
+   p[0]=v>>24;p[1]=v>>16;p[2]=v>>8;p[3]=v;
+@@ -62,10 +67,11 @@
+   if(channel<0)return;
+   uint64_t at=now_ns();
+   if(!at || serial==UINT64_MAX){close_locked();return;}
+-  unsigned char b[80]={0};memcpy(b,"SPSE",4);b[4]=1;b[5]=event;b[7]=flags;
++  unsigned char b[88]={0};memcpy(b,"SPSE",4);b[4]=2;b[5]=event;b[7]=flags;
+   u64(b+8,++serial);u64(b+16,generation);u64(b+24,at);
+   u32(b+32,epoch);u32(b+36,first_sequence);u32(b+40,sequence);u32(b+44,kind);
+   u64(b+48,pts);u32(b+56,frames);u32(b+60,rtp);memcpy(b+64,group,16);
++  u32(b+80,(uint32_t)volume_milli);u32(b+84,volume_revision);
+   int send_flags=0; /* descriptor is O_NONBLOCK on every supported OS */
+ #ifdef MSG_DONTWAIT
+   send_flags|=MSG_DONTWAIT;
+@@ -114,6 +120,8 @@
+   int old;enter(&old);
+   if(channel<0){leave(old);return;}
+   if(!new_owner || owner || generation==UINT64_MAX){fault_locked();leave(old);return;}
++  volume_milli=pending_volume_owner==new_owner?pending_volume_milli:0;
++  volume_revision=pending_volume_owner==new_owner?pending_volume_revision:0;
+   owner=new_owner;generation++;flags=LIVE|(supported?SUPPORTED:0);
+   memset(group,0,16);unsigned char parsed[16];
+   if(supported && pending_owner==new_owner && pending_valid && pending_accepted &&
+@@ -142,6 +150,7 @@
+   int old;enter(&old);
+   if(channel>=0) {
+     if(owner==which)fault_locked();
++    if(pending_volume_owner!=which){pending_volume_milli=0;pending_volume_revision=0;pending_volume_owner=which;}
+     pending_owner=which;pending_accepted=0;
+     memset(pending_group,0,16);pending_valid=uuid(gid,pending_group);
+   }
+@@ -150,6 +159,7 @@
+ void spobs_forget(const void *which) {
+   int old;enter(&old);
+   if(channel>=0 && owner==which) {flags&=~LIVE;emit_locked(END);owner=NULL;}
++  if(pending_volume_owner==which){pending_volume_owner=NULL;pending_volume_revision=0;pending_volume_milli=0;}
+   if(pending_owner==which){pending_owner=NULL;pending_valid=pending_accepted=0;memset(pending_group,0,16);}
+   leave(old);
+ }
+@@ -173,3 +183,28 @@
+   leave(old);
+ }
+ void spobs_fault(void) {int old;enter(&old);fault_locked();leave(old);}
++
++void spobs_volume_text(const void *which,const char *text) {
++  if(!text || strnlen(text,65)>64)return;
++  errno=0;char *end;double value=strtod(text,&end);
++  if(errno || end==text || !isfinite(value))return;
++  while(*end && isspace((unsigned char)*end))end++;
++  if(*end || !(value==-144.0 || (value>=-30.0 && value<=0.0)))return;
++  int32_t milli=(int32_t)llround(value*1000.0);
++  int old;enter(&old);
++  if(channel>=0 && owner==which && (flags&LIVE)) {
++    if(!volume_revision || milli!=volume_milli) {
++      if(volume_revision==UINT32_MAX){fault_locked();leave(old);return;}
++      volume_milli=milli;volume_revision++;
++      pending_volume_owner=which;pending_volume_milli=milli;pending_volume_revision=volume_revision;
++      emit_locked(VOLUME);
++    }
++  } else if(channel>=0) {
++    if(pending_volume_owner!=which){pending_volume_owner=which;pending_volume_revision=0;pending_volume_milli=0;}
++    if(!pending_volume_revision || pending_volume_milli!=milli) {
++      if(pending_volume_revision==UINT32_MAX){fault_locked();leave(old);return;}
++      pending_volume_milli=milli;pending_volume_revision++;
++    }
++  }
++  leave(old);
++}
+--- a/session_observer.h
++++ b/session_observer.h
+@@ -11,5 +11,6 @@
+ void spobs_setup_result(const void *owner, const char *gid, int status, int failed);
+ void spobs_written(unsigned kind, uint32_t epoch, uint32_t sequence,
+                    uint64_t pts, uint32_t frames, uint32_t rtp);
++void spobs_volume_text(const void *owner, const char *text);
+ void spobs_fault(void);
+ #endif
+--- a/rtsp.c
++++ b/rtsp.c
+@@ -3280,6 +3280,7 @@
+       if (conn != NULL) {
+         conn->own_airplay_volume = volume;
+         conn->own_airplay_volume_set = 1;
++        spobs_volume_text(conn, cp + strlen("volume: "));
+       }
+       pthread_cleanup_pop(1); // release the principal_conn lock
+                               // #ifdef CONFIG_DBUS_INTERFACE

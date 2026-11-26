@@ -1,0 +1,36 @@
+#!/bin/sh
+# Stage primary code/config/unit. Activation is a separate explicit handoff.
+set -eu
+if [ "$#" -ne 2 ] || [ "$(id -u)" -ne 0 ]; then
+    echo "Usage: sudo $0 BUILT_RECEIVER_ELF PRIMARY_CONFIG_JSON" >&2
+    exit 2
+fi
+source_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+python3 -I -S -B - "$source_dir/primary" "$1" "$2" <<'PY'
+import hashlib,importlib.util,json,os,pathlib,pwd,shutil,stat,subprocess,sys
+source,elf,config=map(pathlib.Path,sys.argv[1:]);destination=pathlib.Path('/opt/office-primary');settings=pathlib.Path('/etc/office-primary');unit=pathlib.Path('/etc/systemd/system/office-primary.service')
+if destination.exists() or settings.exists() or unit.exists():raise SystemExit('Existing primary installation preserved; review its upgrade/recovery state first.')
+account=pwd.getpwnam('play3-airplay')
+if subprocess.run(['systemctl','is-active','--quiet','play3-airplay-clock.service']).returncode:raise SystemExit('Configure and start the existing shared clock service first.')
+spec=importlib.util.spec_from_file_location('primary_launch',source/'launch.py');module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);module.verify(source)
+manifest=json.loads((source/'MANIFEST.json').read_bytes())
+if elf.is_symlink() or not elf.is_file() or elf.stat().st_size>128*2**20:raise SystemExit('Receiver must be a reviewed regular ELF.')
+binary=elf.read_bytes();value=json.loads(config.read_bytes())
+if value['receiver']['executable']!=str(destination/'receiver-source/out/shairport-sync') or hashlib.sha256(binary).hexdigest()!=value['receiver']['sha256']:raise SystemExit('Receiver config path/hash does not match the reviewed install.')
+# Require the notices produced by this exact source recipe alongside its ELF.
+notices=elf.parent/'licenses';build=elf.parent/'build.json'
+if not notices.is_dir() or not build.is_file() or json.loads(build.read_bytes()).get('sha256')!=value['receiver']['sha256']:raise SystemExit('Exact build record and generated licenses are required.')
+destination.mkdir(mode=0o755)
+for name in list(manifest['files'])+['MANIFEST.json']:
+ target=destination/name;target.parent.mkdir(mode=0o755,parents=True,exist_ok=True);shutil.copyfile(source/name,target);target.chmod(0o644)
+output=destination/'receiver-source/out';output.mkdir(mode=0o755,parents=True);(output/'shairport-sync').write_bytes(binary);(output/'shairport-sync').chmod(0o755)
+shutil.copytree(notices,output/'licenses');shutil.copyfile(build,output/'build.json')
+settings.mkdir(mode=0o750);os.chown(settings,0,account.pw_gid);path=settings/'config.json';path.write_text(json.dumps(value,indent=2)+'\n');path.chmod(0o640);os.chown(path,0,account.pw_gid)
+# Existing account and clock are shared with the released relay; no new identity.
+shutil.copyfile(destination/'office-primary.service',unit);unit.chmod(0o644)
+subprocess.run(['/usr/sbin/runuser','-u','play3-airplay','--','/usr/bin/python3','-I','-S','-B',str(destination/'launch.py'),'--config',str(path),'validate'],check=True)
+subprocess.run(['systemd-analyze','verify',str(unit)],check=True)
+subprocess.run(['systemctl','daemon-reload'],check=True)
+print('Primary staged and validated. No receiver was stopped or started.')
+print('Use the documented target-specific handoff; retain the original profile for rollback.')
+PY

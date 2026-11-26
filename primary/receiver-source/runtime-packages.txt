@@ -1,0 +1,11 @@
+libavcodec61
+libswresample5
+libavutil59
+libuuid1
+libgcrypt20
+libsodium23
+libplist-2.0-4
+libavahi-client3
+libssl3t64
+libconfig11
+libpopt0

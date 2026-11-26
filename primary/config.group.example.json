@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "local_ip": "192.168.50.10",
+  "target": {
+    "ip": "192.168.50.20",
+    "uuid": "RINCON_00000000000101400",
+    "port": 1400
+  },
+  "coordinator": {
+    "ip": "192.168.50.30",
+    "uuid": "RINCON_00000000000201400",
+    "port": 1400,
+    "airplay_instance": "Compatible Sonos._airplay._tcp.local."
+  },
+  "wav_port": 19091,
+  "event_port": 19092,
+  "state_dir": "/var/lib/office-primary/state",
+  "scope_dir": "/var/lib/office-primary/scope",
+  "receiver": {
+    "executable": "/opt/office-primary/receiver-source/out/shairport-sync",
+    "sha256": "f7896a553373631492f3148a45ae77f31d5e22a77436771f526c19430cac060a",
+    "name": "Office Sonos",
+    "port": 7000
+  },
+  "max_volume": 100
+}

@@ -1,0 +1,29 @@
+{
+  "files": {
+    ".dockerignore": "62cf4859ef2c0e5c0a6a329f445c45c242e9e50db27889145db86a96d6409a6a",
+    ".gitignore": "4058b794400d56458905de20297022c8ae789872460e54082d6cb8d98abfb072",
+    "Dockerfile": "7a2f73e1bc8cca0a1343fa34028b17b97d5e5226339e3f9c046a2a1c84d4a42d",
+    "LICENSE": "af5575361fce9f79a8907210674fabfc28a726e1297023396030e8fa9edc7d07",
+    "NOTICES.md": "99ac2a599298171506f68ef7c225afeed181c3a0f23a05d857faa4240a2ab8e4",
+    "README.md": "a2c39577b6dddbaace3b215dc67e35ec4323521b24e0f294d00fe6fd64a86016",
+    "RECEIVER-CONTRACT.md": "f6610d37fd670b7ca58cd254ba4346babbf3f80659303dafc1f3c72e869d7648",
+    "VERIFICATION.md": "3408456f9a0b836b8c15ff24fa74025a20bd4838ebf9c0ede8956307c7e72dc5",
+    "build-container.sh": "94c8825c9384191e3ab24e0b3f5ebc33ee31ac9643390396590023e2e385608a",
+    "build-packages.txt": "49dd629db35d411dca58ec6fe53a93e1803f792caf95ad1b70a7c18e627687d7",
+    "build.py": "a66e0f7c0e6753786538d9dc689587c8439ea56492aeb62848bbe6270eb54c8f",
+    "check-observer.py": "61368a2a2611d189a37dca602cce52b753e414b77a50db86bd9035f1cba9f851",
+    "fetch-source.py": "494aae08b107037c9aaaf644b2e775ef2fb16d2b473be5062c199cc7cec257b0",
+    "patches/01-startup.patch": "a819a3cbea8f0a2d3cf26a4dec58b908a63ad121d48e2302ee91705825d366dc",
+    "patches/02-observer.patch": "5a6997542bf5f386b5aeedf7a8d258912e04795b88df270ab3a45305fca44fce",
+    "patches/03-volume.patch": "9ed98ec77431629623262c4fb2878d3f4afc3f9149f5b4f317d6855a9d0e5500",
+    "patches/04-pipe-cancellation.patch": "24006b4110e1fc65c3dc77b91d208e551c9ad2034f0906691df922b775066f7b",
+    "runtime-packages.txt": "e3c01509e354eef453516b51695903d0039d52234943553be12fe65da6ce490e",
+    "source.json": "57f8d15eb7b629776a4ed07ad8c764489a52bcdb0419a3df1ad8bb4254d8de50",
+    "validation.json": "4d3e9a37f253df81142f1bd907c540d640a54be67fd11b44e0476b4f5885a292",
+    "verify-system.py": "8f9f8753a11d95b3e28679d37816b2740d9959156a04d3f6c0c2ebefb263c903"
+  },
+  "generated_binary_not_included": true,
+  "live_primary_verified": false,
+  "scope": "shared AirPlay receiver source; no primary or experimental daemon configuration",
+  "version": 2
+}

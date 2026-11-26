@@ -1,0 +1,319 @@
+--- a/player.c
++++ b/player.c
+@@ -29,6 +29,7 @@
+  */
+ 
+ #include "spts_diag.h"
++#include "session_observer.h"
+ #include <assert.h>
+ #include <errno.h>
+ #include <fcntl.h>
+@@ -3446,6 +3447,7 @@
+     debug(2, "Connection %d: player: stop the output backend.", conn->connection_number);
+     config.output->stop();
+   }
++  spobs_end(conn);
+ 
+   int oldState;
+   pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &oldState);
+@@ -5530,6 +5532,12 @@
+ 
+ int player_play(rtsp_conn_info *conn) {
+   debug(2, "Connection %d: player_play.", conn->connection_number);
++#ifdef CONFIG_AIRPLAY_2
++  spobs_begin(conn, conn->airplay_gid, conn->airplay_type==ap_2 &&
++      conn->airplay_stream_category==ptp_stream && conn->airplay_stream_type==buffered_stream);
++#else
++  spobs_begin(conn, NULL, 0);
++#endif
+   export_session_identity(conn);
+   command_start(); // before startup, and before the prepare() method runs
+   // give the output device as much advance warning as possible to get ready
+--- a/rtsp.c
++++ b/rtsp.c
+@@ -28,6 +28,7 @@
+  */
+ 
+ #include "spts_diag.h"
++#include "session_observer.h"
+ #include <arpa/inet.h>
+ #include <errno.h>
+ #include <fcntl.h>
+@@ -2482,6 +2483,7 @@
+   cache_ap2_client_identity(conn, messagePlist, streams == NULL);
+ #endif
+   if (streams == NULL) {
++    spobs_initial(conn, NULL); /* missing GID must not inherit earlier SETUP evidence */
+     // no "streams" plist, so it must (?) be an initial setup
+     debug(2,
+           "Connection %d SETUP: No \"streams\" array has been found -- create an event thread "
+@@ -2564,6 +2566,7 @@
+               if (conn->airplay_gid)
+                 free(conn->airplay_gid);
+               conn->airplay_gid = gid; // it'll be free'd later on...
++              spobs_initial(conn, gid);
+             } else {
+               debug(1, "Invalid groupUUID");
+             }
+@@ -4065,6 +4068,7 @@
+       player_stop(conn); // this nulls the player_thread and cancels the threads...
+       activity_monitor_signify_activity(0); // inactive, and should be after command_stop()
+     }
++    spobs_forget(conn);
+ 
+     if (conn->fd > 0) {
+       debug(
+@@ -4346,6 +4350,10 @@
+       debug_log_rtsp_message(dl, NULL, resp);
+       // if (conn->stop == 0) {
+       int err = msg_write_response(conn, resp);
++#ifdef CONFIG_AIRPLAY_2
++      if (!strcmp(req->method, "SETUP"))
++        spobs_setup_result(conn, conn->airplay_gid, resp->respcode, err);
++#endif
+       spdiag_bump(err?SPD_RTSP_WRITE_FAILED:SPD_RTSP_WRITE_OK,1);
+       spdiag_rtsp(req->method,req->path,resp->respcode,
+          conn->airplay_stream_type==buffered_stream?3:(conn->airplay_stream_type==realtime_stream?2:1),err);
+--- a/audio_pipe.c
++++ b/audio_pipe.c
+@@ -29,6 +29,7 @@
+  */
+ 
+ #include "spts_diag.h"
++#include "session_observer.h"
+ #include "audio.h"
+ #include "common.h"
+ #include <errno.h>
+@@ -85,6 +86,8 @@
+   }
+   enum spw_failure written=spw_send_until(&pts_writer, kind, pts_epoch, ++pts_sequence, target,
+                         observed, frames, rtp, pcm, deadline);
++  if (written==SPW_OK) spobs_written(kind, pts_epoch, pts_sequence, target, frames, rtp);
++  else spobs_fault();
+   if (written==SPW_OK && kind<=PTS_UNTIMED) spdiag_bump(kind==PTS_TIMED?SPD_WIRE_TIMED_OK:SPD_WIRE_UNTIMED_OK,1);
+   return written;
+ }
+@@ -104,6 +107,7 @@
+ }
+ 
+ static void pts_report_failure(enum spw_failure result) {
++  if (result != SPW_OK) spobs_fault();
+   if (result != SPW_OK)
+     die("SPTS write failure code=%u bytes=%zu", (unsigned)result,
+         pts_writer_ready ? pts_writer.bytes_in_failed_record : 0);
+@@ -304,6 +308,8 @@
+   if (mkfifo(pipename, 0666) && errno != EEXIST)
+     die("Could not create audio pipe \"%s\"", pipename);
+   umask(oldumask);
++  if (getenv("SPS_SELECTION_FD") && (!timestamped_pipe || spobs_init_env()!=0))
++    die("SPTS selection channel unavailable");
+   if (startup_diagnostics && spdiag_start()!=0) warn("SPTS startup diagnostics unavailable");
+ 
+   debug(1, "audio pipe name is \"%s\"", pipename);
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -36,7 +36,7 @@
+ # See below for the flags for the test client program
+ 
+ shairport_sync_SOURCES = shairport.c bonjour_strings.c mdns/mdns.c common.c rtp.c \
+-  player.c audio.c loudness.c activity_monitor.c \
++  player.c audio.c loudness.c activity_monitor.c session_observer.c \
+   rtsp.c \
+   utilities/debug.c \
+   utilities/network_utilities.c \
+--- /dev/null
++++ b/session_observer.c
+@@ -0,0 +1,175 @@
++/* Bounded optional local evidence; no RTSP payload/header/identity logging.
++ * This channel attests process lineage, not an authenticated remote sender.
++ * Write failure disables evidence permanently; audio behavior is unchanged. */
++#define _POSIX_C_SOURCE 200809L
++#include "session_observer.h"
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <pthread.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <time.h>
++#include <unistd.h>
++
++enum { LIVE=1, GID=2, SETUP=4, SUPPORTED=8, BROKEN=16 };
++enum { HELLO=1, BEGIN=2, ACCEPT=3, FRAME=4, END=5, FAULT=6 };
++static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
++static int channel=-1, initialized=0;
++static const void *owner;
++static const void *pending_owner;
++static unsigned char pending_group[16];
++static int pending_valid,pending_accepted;
++static unsigned flags;
++static uint64_t serial,generation,last_emit;
++static uint32_t epoch,first_sequence,sequence,kind,frames,rtp;
++static uint64_t pts;
++static unsigned char group[16];
++
++static void u32(unsigned char *p,uint32_t v) {
++  p[0]=v>>24;p[1]=v>>16;p[2]=v>>8;p[3]=v;
++}
++static void u64(unsigned char *p,uint64_t v) {u32(p,v>>32);u32(p+4,v);}
++static uint64_t now_ns(void) {
++  struct timespec t;
++  if(clock_gettime(CLOCK_MONOTONIC,&t))return 0;
++  return (uint64_t)t.tv_sec*1000000000+(uint64_t)t.tv_nsec;
++}
++static int nibble(unsigned char c) {
++  if(c>='0' && c<='9')return c-'0';
++  if(c>='a' && c<='f')return c-'a'+10;
++  if(c>='A' && c<='F')return c-'A'+10;
++  return -1;
++}
++static int uuid(const char *s,unsigned char out[16]) {
++  if(!s || strnlen(s,37)!=36)return 0;
++  unsigned n=0,nonzero=0;
++  for(unsigned i=0;i<36;) {
++    if(i==8 || i==13 || i==18 || i==23) {if(s[i++]!='-')return 0;continue;}
++    int hi=nibble(s[i++]),lo=nibble(s[i++]);
++    if(hi<0 || lo<0 || n>=16)return 0;
++    out[n++]=(unsigned char)((hi<<4)|lo);nonzero|=out[n-1];
++  }
++  return n==16 && nonzero;
++}
++static void close_locked(void) {
++  if(channel>=0)close(channel);
++  channel=-1;flags=BROKEN;memset(group,0,sizeof(group));
++}
++static void emit_locked(unsigned event) {
++  if(channel<0)return;
++  uint64_t at=now_ns();
++  if(!at || serial==UINT64_MAX){close_locked();return;}
++  unsigned char b[80]={0};memcpy(b,"SPSE",4);b[4]=1;b[5]=event;b[7]=flags;
++  u64(b+8,++serial);u64(b+16,generation);u64(b+24,at);
++  u32(b+32,epoch);u32(b+36,first_sequence);u32(b+40,sequence);u32(b+44,kind);
++  u64(b+48,pts);u32(b+56,frames);u32(b+60,rtp);memcpy(b+64,group,16);
++  int send_flags=0; /* descriptor is O_NONBLOCK on every supported OS */
++#ifdef MSG_DONTWAIT
++  send_flags|=MSG_DONTWAIT;
++#endif
++#ifdef MSG_NOSIGNAL
++  send_flags|=MSG_NOSIGNAL;
++#endif
++  ssize_t sent=send(channel,b,sizeof(b),send_flags);
++  /* Datagram send is atomic. No retry, partial record, queue or log. */
++  if(sent!=(ssize_t)sizeof(b))close_locked();else last_emit=at;
++}
++static void fault_locked(void) {flags=BROKEN;memset(group,0,16);emit_locked(FAULT);close_locked();}
++static void enter(int *old) {pthread_setcancelstate(PTHREAD_CANCEL_DISABLE,old);pthread_mutex_lock(&lock);}
++static void leave(int old) {pthread_mutex_unlock(&lock);pthread_setcancelstate(old,NULL);}
++
++int spobs_init_fd(int fd) {
++  int old;enter(&old);
++  if(initialized){leave(old);return -1;}initialized=1;
++  struct sockaddr_un address; socklen_t length=sizeof(address),size=sizeof(int);int type=0;
++  if(fd<3 || getsockopt(fd,SOL_SOCKET,SO_TYPE,&type,&size) || type!=SOCK_DGRAM ||
++     getsockname(fd,(struct sockaddr *)&address,&length) || address.sun_family!=AF_UNIX ||
++     getpeername(fd,(struct sockaddr *)&address,&length) || address.sun_family!=AF_UNIX) {
++    leave(old);return -1;
++  }
++  int existing=fcntl(fd,F_GETFD),mode=fcntl(fd,F_GETFL);
++  if(existing<0 || mode<0 || fcntl(fd,F_SETFD,existing|FD_CLOEXEC) ||
++     fcntl(fd,F_SETFL,mode|O_NONBLOCK)) {leave(old);return -1;}
++#ifdef SO_NOSIGPIPE
++  int yes=1;
++  if(setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&yes,sizeof(yes))){leave(old);return -1;}
++#endif
++  channel=fd;emit_locked(HELLO);int ok=channel>=0;leave(old);return ok?0:-1;
++}
++int spobs_init_env(void) {
++  const char *s=getenv("SPS_SELECTION_FD");
++  if(!s)return 0;
++  if(strnlen(s,11)==0 || strnlen(s,11)>10)return -1;
++  for(const char *p=s;*p;p++)if(*p<'0'||*p>'9')return -1;
++  errno=0;char *end=NULL;long fd=strtol(s,&end,10);
++  if(errno || *end || fd<3 || fd>INT_MAX)return -1;
++  int result=spobs_init_fd((int)fd);
++  unsetenv("SPS_SELECTION_FD"); /* start/stop helper execs cannot inherit it */
++  return result;
++}
++void spobs_begin(const void *new_owner,const char *gid,int supported) {
++  int old;enter(&old);
++  if(channel<0){leave(old);return;}
++  if(!new_owner || owner || generation==UINT64_MAX){fault_locked();leave(old);return;}
++  owner=new_owner;generation++;flags=LIVE|(supported?SUPPORTED:0);
++  memset(group,0,16);unsigned char parsed[16];
++  if(supported && pending_owner==new_owner && pending_valid && pending_accepted &&
++     uuid(gid,parsed) && !memcmp(parsed,pending_group,16)) {
++    memcpy(group,parsed,16);flags|=GID;
++  }
++  epoch=first_sequence=sequence=kind=frames=rtp=0;pts=0;
++  emit_locked(BEGIN);leave(old);
++}
++void spobs_setup_result(const void *which,const char *gid,int status,int failed) {
++  int old;enter(&old);
++  if(channel>=0 && pending_owner==which && owner!=which) {
++    unsigned char parsed[16];
++    pending_accepted=!failed && status==200 && pending_valid && uuid(gid,parsed) &&
++                     !memcmp(parsed,pending_group,16);
++  }
++  if(channel>=0 && owner==which) {
++    unsigned char parsed[16];
++    if(failed || status!=200 || !(flags&GID) || !uuid(gid,parsed) || memcmp(group,parsed,16))
++      fault_locked();
++    else {flags|=SETUP;emit_locked(ACCEPT);}
++  }
++  leave(old);
++}
++void spobs_initial(const void *which,const char *gid) {
++  int old;enter(&old);
++  if(channel>=0) {
++    if(owner==which)fault_locked();
++    pending_owner=which;pending_accepted=0;
++    memset(pending_group,0,16);pending_valid=uuid(gid,pending_group);
++  }
++  leave(old);
++}
++void spobs_forget(const void *which) {
++  int old;enter(&old);
++  if(channel>=0 && owner==which) {flags&=~LIVE;emit_locked(END);owner=NULL;}
++  if(pending_owner==which){pending_owner=NULL;pending_valid=pending_accepted=0;memset(pending_group,0,16);}
++  leave(old);
++}
++void spobs_written(unsigned k,uint32_t e,uint32_t s,uint64_t p,uint32_t f,uint32_t r) {
++  int old;enter(&old);
++  if(channel<0){leave(old);return;}
++  if(!owner || !(flags&LIVE) || !s || s<=sequence || k<1 || k>4 ||
++     (k==3 ? (!e || e<=epoch || p || f || r) : (e!=epoch || !first_sequence)) ||
++     (k==4 && (p||f||r)) || (k<=2 && (!f || f>8192)) ||
++     (k==1 && !p) || (k==2 && p)) {fault_locked();leave(old);return;}
++  if(k==3){epoch=e;first_sequence=s;}
++  sequence=s;kind=k;pts=p;frames=f;rtp=r;
++  if(k==4)flags&=~LIVE;
++  uint64_t at=now_ns();
++  if(k>=3 || !last_emit || at-last_emit>=250000000)emit_locked(FRAME);
++  leave(old);
++}
++void spobs_end(const void *which) {
++  int old;enter(&old);
++  if(channel>=0 && owner==which) {flags&=~LIVE;emit_locked(END);owner=NULL;}
++  leave(old);
++}
++void spobs_fault(void) {int old;enter(&old);fault_locked();leave(old);}
+--- /dev/null
++++ b/session_observer.h
+@@ -0,0 +1,15 @@
++#ifndef SPS_SESSION_OBSERVER_H
++#define SPS_SESSION_OBSERVER_H
++#include <stdint.h>
++/* Optional inherited AF_UNIX datagram endpoint. Never a public socket or log. */
++int spobs_init_fd(int fd);
++int spobs_init_env(void);
++void spobs_initial(const void *owner, const char *fresh_gid);
++void spobs_begin(const void *owner, const char *gid, int supported);
++void spobs_end(const void *owner);
++void spobs_forget(const void *owner);
++void spobs_setup_result(const void *owner, const char *gid, int status, int failed);
++void spobs_written(unsigned kind, uint32_t epoch, uint32_t sequence,
++                   uint64_t pts, uint32_t frames, uint32_t rtp);
++void spobs_fault(void);
++#endif

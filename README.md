@@ -60,6 +60,20 @@ for casual listening across rooms. To tune it, set
 Shairport Sync config and restart the services. A negative value moves playback
 earlier. [Shairport Sync timing guide](https://github.com/mikebrady/shairport-sync/blob/5.6.3/ADVANCED%20TOPICS/AdjustingSync.md)
 
+## Automatic native Sonos grouping
+
+Version 1.2.0 adds an [opt-in receiver](primary/README.md) that automatically
+groups a Play:3 with a configured Sonos Roam when you select both in the same
+AirPlay session. Select the Play:3 alone for standalone WAV playback. Select
+both speakers before pressing Play to avoid the audible interruption that can
+occur when adding the Play:3 mid-track.
+
+The grouping receiver requires Debian 13 ARM64, the pinned receiver build, and
+the existing shared clock service. Follow its [installation and rollback
+instructions](primary/README.md#stage-an-existing-pi-installation) to switch the
+profile for your chosen speaker. The standalone installer below remains
+available for other profiles and existing setups.
+
 ## Install on a 64-bit Raspberry Pi
 
 The installer targets Raspberry Pi OS or Debian on ARM64 with systemd. Use a
